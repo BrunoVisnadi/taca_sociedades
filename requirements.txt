@@ -1,0 +1,7 @@
+flask
+sqlalchemy>=2.0
+psycopg[binary]
+gunicorn
+python-dotenv
+flask-login
+werkzeug

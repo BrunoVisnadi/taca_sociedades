@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: flask-neon-app
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        # defina o valor no dashboard do Render (não commite secrets)
+        sync: false
