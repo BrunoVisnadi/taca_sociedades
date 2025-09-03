@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
@@ -11,7 +12,14 @@ from models import (
     EditionMember, Person, User, DebateJudge  # User vem do seu models.py
 )
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+BASE_DIR = Path(__file__).resolve().parent
+
+app = Flask(
+    __name__,
+    template_folder=str(BASE_DIR / "templates"),
+    static_folder=str(BASE_DIR / "static"),
+    static_url_path="/static",
+)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-unsafe")
 
 # -------- Flask-Login --------
