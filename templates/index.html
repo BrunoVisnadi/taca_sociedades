@@ -30,26 +30,36 @@
     </div>
   </header>
 
-
   <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
     <!-- Sidebar -->
     <aside class="lg:col-span-3">
       <nav class="sticky top-20 space-y-2">
-          <a class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-sky-100 text-sky-900 border border-sky-200" href="/">Início</a>
-          {% if current_user.is_authenticated and current_user.role in ['director','admin'] %}
-            <a class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent" href="/results">Inserir resultados</a>
-          {% endif %}
+        <a class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-sky-100 text-sky-900 border border-sky-200" href="/">Início</a>
+
+        {% if session.get('auth_kind') == 'staff' and session.get('role') in ['director','admin'] %}
+          <a class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent" href="/results">Inserir resultados</a>
+        {% endif %}
+
         <a href="/pairings" class="block rounded-lg px-3 py-2 hover:bg-sky-50 text-slate-700">
           Próximos pareamentos
         </a>
         <a href="/resultados" class="block rounded-lg px-3 py-2 hover:bg-sky-50 text-slate-700">
           Resultados
         </a>
-        {% if current_user.is_authenticated %}
-            <form method="post" action="/logout"><button class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent">Sair</button></form>
-          {% else %}
-            <a class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent" href="/login">Login</a>
-          {% endif %}
+
+        {% if session.get('auth_kind') == 'society' %}
+          <a href="{{ url_for('page_escalacao') }}" class="block rounded-lg px-3 py-2 hover:bg-sky-50 text-slate-700">
+            Escalação
+          </a>
+        {% endif %}
+
+        {% if session.get('auth_kind') in ['staff','society'] %}
+          <form method="post" action="/logout">
+            <button class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent">Sair</button>
+          </form>
+        {% else %}
+          <a class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent" href="/login">Login</a>
+        {% endif %}
       </nav>
     </aside>
 
@@ -124,12 +134,13 @@
         const json = await res.json();
         const data = json.data || [];
 
-        // ordenação já vem do backend, mas garantimos
+        // Garantimos a ordenação (pontos, speaker points, 1ºs, 2ºs, nome)
         data.sort((a, b) => {
           if (b.points !== a.points) return b.points - a.points;
           if (b.speaker_points !== a.speaker_points) return b.speaker_points - a.speaker_points;
           if (b.firsts !== a.firsts) return b.firsts - a.firsts;
-          return (a.society_name || '').localeCompare(b.society_name || '');
+          if (b.seconds !== a.seconds) return b.seconds - a.seconds;
+          return (a.short_name || '').localeCompare(b.short_name || '');
         });
 
         standingsBody.innerHTML = '';
@@ -139,16 +150,16 @@
           tr.innerHTML = `
             <td class="px-4 py-3 font-medium text-slate-700">${idx + 1}</td>
             <td class="px-4 py-3">
-              <span class="inline-flex h-6 min-w-6 px-2 items-center justify-center rounded-md bg-sky-100 text-sky-800 text-xs font-semibold">
-                ${s.short_name}
-              </span>
+              <a href="/sociedade/${s.edsoc_id}" class="text-sky-700 hover:underline">
+                ${s.short_name || ''}
+              </a>
             </td>
-            <td class="px-4 py-3 text-center font-semibold text-slate-800">${s.points}</td>
-            <td class="px-4 py-3 text-center">${s.speaker_points}</td>
-            <td class="px-4 py-3 text-center">${s.firsts}</td>
-            <td class="px-4 py-3 text-center">${s.seconds}</td>
-            <td class="px-4 py-3 text-center">${s.debates}</td>
-            <td class="px-4 py-3 text-center">${percAproveitamento(s.points, s.debates)}%</td>
+            <td class="px-4 py-3 text-center font-semibold text-slate-800">${s.points ?? 0}</td>
+            <td class="px-4 py-3 text-center">${s.speaker_points ?? 0}</td>
+            <td class="px-4 py-3 text-center">${s.firsts ?? 0}</td>
+            <td class="px-4 py-3 text-center">${s.seconds ?? 0}</td>
+            <td class="px-4 py-3 text-center">${s.debates ?? 0}</td>
+            <td class="px-4 py-3 text-center">${percAproveitamento(s.points ?? 0, s.debates ?? 0)}%</td>
           `;
           standingsBody.appendChild(tr);
         });

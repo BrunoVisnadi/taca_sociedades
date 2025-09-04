@@ -8,22 +8,17 @@
 </head>
 <body class="min-h-screen bg-gradient-to-b from-sky-50 to-white text-slate-800">
   <header class="sticky top-0 z-20 backdrop-blur bg-white/70 border-b border-slate-200">
-    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
-
-      <!-- Esquerda: logo Taça + título -->
-      <div class="flex items-center gap-4">
-        <img src="{{ url_for('static', filename='taca.png') }}"
-             alt="Taça das Sociedades"
-             class="h-12 w-12 object-contain" />
-        <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-sky-800">
-          Resultados
-        </h1>
+    <div class="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <img src="{{ url_for('static', filename='taca.png') }}" class="h-10 w-10 object-contain" alt="Taça">
+        <h1 class="text-2xl font-bold text-sky-800">Escalação</h1>
       </div>
-      <!-- Direita: logo CONDEB -->
-      <div>
-        <img src="{{ url_for('static', filename='condeb.png') }}"
-             alt="CONDEB"
-             class="h-12 object-contain" />
+      <div class="flex items-center gap-2">
+        <a href="{{ url_for('home') }}"
+           class="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-slate-700 hover:bg-slate-50">
+          ← Voltar à página principal
+        </a>
+        <img src="{{ url_for('static', filename='condeb.png') }}" class="h-8 object-contain" alt="CONDEB">
       </div>
     </div>
   </header>

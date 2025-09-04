@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Login • Taça das Sociedades</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-sky-50 to-white text-slate-800">
+  <main class="mx-auto max-w-md px-4 sm:px-6 lg:px-8 py-10">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+      <div class="flex items-center justify-between mb-6">
+        <div class="flex items-center gap-3">
+          <img src="{{ url_for('static', filename='taca.png') }}" alt="Taça" class="h-10 w-10 object-contain">
+          <h1 class="text-xl font-bold text-sky-800">Taça das Sociedades</h1>
+        </div>
+        <img src="{{ url_for('static', filename='condeb.png') }}" alt="CONDEB" class="h-8 object-contain">
+      </div>
+
+      {% with msgs = get_flashed_messages(with_categories=true) %}
+        {% if msgs %}
+          <div class="space-y-2 mb-4">
+            {% for cat, msg in msgs %}
+              <div class="rounded-lg px-3 py-2 text-sm
+                          {{ 'bg-rose-50 text-rose-800 border border-rose-200' if cat=='error' else 'bg-emerald-50 text-emerald-800 border border-emerald-200' }}">
+                {{ msg }}
+              </div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <form method="post" action="{{ url_for('do_login', next=request.args.get('next')) }}" class="space-y-4">
+        <div class="flex gap-2 bg-slate-100 rounded-lg p-1">
+          <input type="hidden" name="mode" id="mode" value="staff">
+          <button type="button" data-mode="staff"
+                  class="tab-btn flex-1 rounded-md px-3 py-2 text-sm font-medium bg-white text-sky-700 border border-sky-200">
+            Organização (staff)
+          </button>
+          <button type="button" data-mode="society"
+                  class="tab-btn flex-1 rounded-md px-3 py-2 text-sm font-medium text-slate-600">
+            Sociedade
+          </button>
+        </div>
+
+        <div>
+          <label class="block text-sm text-slate-700 mb-1">E-mail</label>
+          <input name="email" type="text" required class="w-full rounded-lg border-slate-300 focus:ring-sky-500 focus:border-sky-500">
+        </div>
+        <div>
+          <label class="block text-sm text-slate-700 mb-1">Senha</label>
+          <input name="password" type="password" required class="w-full rounded-lg border-slate-300 focus:ring-sky-500 focus:border-sky-500">
+        </div>
+
+        <button class="w-full rounded-lg bg-sky-600 text-white px-4 py-2 hover:bg-sky-700">Entrar</button>
+      </form>
+    </div>
+  </main>
+
+  <script>
+    // Toggle staff/society
+    const modeInput = document.getElementById('mode');
+    const btns = document.querySelectorAll('.tab-btn');
+    btns.forEach(b => b.addEventListener('click', () => {
+      btns.forEach(x => x.classList.remove('bg-white','text-sky-700','border','border-sky-200'));
+      b.classList.add('bg-white','text-sky-700','border','border-sky-200');
+      modeInput.value = b.dataset.mode;
+    }));
+  </script>
+</body>
+</html>

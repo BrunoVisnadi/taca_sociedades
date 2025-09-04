@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{{ society.short or society.full }} • Histórico</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-sky-50 to-white text-slate-800">
+
+  <!-- Header reutilizável com Voltar -->
+  <header class="sticky top-0 z-20 backdrop-blur bg-white/70 border-b border-slate-200">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <img src="{{ url_for('static', filename='taca.png') }}" class="h-10 w-10 object-contain" alt="Taça">
+        <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-sky-800">
+          {{ society.short or society.full }}
+        </h1>
+      </div>
+      <div class="flex items-center gap-2">
+        <a href="{{ url_for('home') }}" class="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-slate-700 hover:bg-slate-50">
+          ← Voltar à página principal
+        </a>
+        <img src="{{ url_for('static', filename='condeb.png') }}" class="h-8 object-contain" alt="CONDEB">
+      </div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+
+    <!-- Tabela de debatedores -->
+    <section class="bg-white rounded-2xl shadow-sm border border-slate-200 p-5">
+      <h2 class="text-lg font-semibold text-sky-900 mb-3">Debatedores</h2>
+      {% if debaters and debaters|length > 0 %}
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="text-left text-slate-600">
+              <th class="px-3 py-2">Nome</th>
+              <th class="px-3 py-2">Nº de debates</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for d in debaters %}
+              <tr class="border-t border-slate-200">
+                <td class="px-3 py-2">{{ d.name }}</td>
+                <td class="px-3 py-2">{{ d.times }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+        <div class="text-slate-600 text-sm">Nenhum debatedor cadastrado.</div>
+      {% endif %}
+    </section>
+
+    <!-- Histórico de rodadas -->
+    <section class="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 space-y-4">
+      <h2 class="text-lg font-semibold text-sky-900">Histórico</h2>
+      {% if history and history|length > 0 %}
+        {% for h in history %}
+          <div class="rounded-xl border border-slate-200 p-4">
+            <div class="flex items-center justify-between">
+              <div class="text-slate-900 font-medium">
+                Rodada #{{ h.round_number }} {{ h.round_name or '' }} • Debate {{ h.deb_number }} • Posição <span class="font-semibold text-sky-800">{{ h.position }}</span>
+              </div>
+              {% if h.round_date %}<div class="text-sm text-slate-600">Data: {{ h.round_date }}</div>{% endif %}
+            </div>
+
+            <div class="mt-2 grid md:grid-cols-2 gap-3">
+              <div>
+                <div class="text-sm text-slate-600">Colocação</div>
+                {% set rank = h.rank %}
+                {% set cls = (
+                  'bg-sky-200 ring-2 ring-sky-500' if rank == 1 else
+                  'bg-sky-100 ring-2 ring-sky-400' if rank == 2 else
+                  'bg-sky-50 ring-2 ring-sky-300'  if rank == 3 else
+                  'bg-slate-50 ring-2 ring-sky-200'
+                ) %}
+                <div class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-1 {{ cls }}">
+                  <span class="text-slate-800 text-sm font-semibold">{{ rank or '—' }}º</span>
+                  {% if h.points is not none %}
+                    <span class="text-xs text-slate-700">({{ h.points }} pts)</span>
+                  {% endif %}
+                </div>
+              </div>
+              <div>
+                <div class="text-sm text-slate-600">Adversários</div>
+                <div class="text-sm text-slate-800">
+                  OG: {{ h.teams.get('OG') }}, OO: {{ h.teams.get('OO') }}, CG: {{ h.teams.get('CG') }}, CO: {{ h.teams.get('CO') }}
+                </div>
+              </div>
+            </div>
+
+            {% if h.scores_published and not h.silent %}
+              <div class="mt-3 text-sm text-slate-700">
+                <span class="font-medium">Totais por posição:</span>
+                <span>OG {{ h.totals.get('OG') or '—' }}, OO {{ h.totals.get('OO') or '—' }}, CG {{ h.totals.get('CG') or '—' }}, CO {{ h.totals.get('CO') or '—' }}</span>
+              </div>
+            {% else %}
+              <div class="mt-3 text-xs text-slate-500">Speaker points não divulgados.</div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="text-slate-600 text-sm">Ainda não há histórico para esta sociedade.</div>
+      {% endif %}
+    </section>
+
+  </main>
+</body>
+</html>

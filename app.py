@@ -1,15 +1,18 @@
 import os
 from pathlib import Path
+from functools import wraps
 
-from flask import Flask, jsonify, render_template, request, redirect, url_for, flash
+from flask import Flask, jsonify, render_template, request, redirect, url_for, flash, session, abort
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
 from werkzeug.security import check_password_hash
-from sqlalchemy import select, func, case, distinct
+from sqlalchemy import select, func, case, distinct, exists, desc
+from sqlalchemy.orm import aliased
 from db import SessionLocal
 from models import (
     Edition, EditionSociety, Society,
     Round, Debate, DebatePosition, Speech,
-    EditionMember, Person, User, DebateJudge
+    EditionMember, Person, User, DebateJudge,
+    SocietyAccount
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,6 +22,12 @@ app = Flask(
     template_folder=str(BASE_DIR / "templates"),
     static_folder=str(BASE_DIR / "static"),
     static_url_path="/static",
+)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # Em produção:
+    # SESSION_COOKIE_SECURE=True  # se seu domínio usa HTTPS (Render usa)
 )
 app.secret_key = os.environ.get("SECRET_KEY", "dev-unsafe")
 
@@ -33,6 +42,427 @@ ORDER_POS = case(
     (DebatePosition.position == "CO", 4),
     else_=99,
 )
+
+def society_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if session.get("auth_kind") != "society" or not session.get("soc_acc_id"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+def _next_round_without_results(sess, edition_id: int):
+    # conta quantas speeches têm score NÃO nulo por rodada
+    scored_count = func.count(
+        case((Speech.score.isnot(None), 1))
+    )
+
+    row = sess.execute(
+        select(
+            Round.id,
+            Round.number,
+            Round.name,
+            Round.scheduled_date,
+            scored_count.label("scored_count"),
+        )
+        .select_from(Round)
+        .join(Debate, Debate.round_id == Round.id, isouter=True)
+        .join(Speech, Speech.debate_id == Debate.id, isouter=True)
+        .where(Round.edition_id == edition_id)
+        .group_by(Round.id)
+        .having(scored_count == 0)           # <-- nenhuma nota lançada na rodada
+        .order_by(Round.number.asc(), Round.id.asc())
+        .limit(1)
+    ).first()
+
+    if not row:
+        return None
+    r_id, r_num, r_name, r_date, _ = row
+    return {"id": r_id, "number": r_num, "name": r_name, "date": r_date}
+
+
+# -------- debates/posição desta sociedade + escalação atual (mesmo que sem notas) --------
+def _debates_of_round_for_soc(sess, round_id: int, edition_society_id: int):
+    debs = sess.execute(
+        select(
+            Debate.id, Debate.number_in_round,
+            DebatePosition.position
+        )
+        .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+        .where(
+            Debate.round_id == round_id,
+            DebatePosition.edition_society_id == edition_society_id
+        )
+        .order_by(Debate.number_in_round.asc())
+    ).all()
+    deb_ids = [d_id for (d_id, _n, _p) in debs]
+
+    sp_rows = []
+    if deb_ids:
+        sp_rows = sess.execute(
+            select(
+                Speech.debate_id, Speech.position, Speech.sequence_in_team,
+                Speech.score,
+                EditionMember.id.label("member_id"),
+                Person.full_name
+            )
+            .join(EditionMember, EditionMember.id == Speech.edition_member_id)
+            .join(Person, Person.id == EditionMember.person_id)
+            .where(Speech.debate_id.in_(deb_ids))
+            .order_by(Speech.debate_id.asc(), Speech.position.asc(), Speech.sequence_in_team.asc())
+        ).all()
+
+    by_key = {}
+    for (d_id, pos, seq, score, mid, name) in sp_rows:
+        key = (d_id, pos)
+        by_key.setdefault(key, {"s1": None, "s2": None, "locked": False})
+        if seq == 1:
+            by_key[key]["s1"] = {"id": mid, "name": name}
+        elif seq == 2:
+            by_key[key]["s2"] = {"id": mid, "name": name}
+        if score is not None:
+            by_key[key]["locked"] = True  # já tem nota => bloqueado
+
+    out = []
+    for (d_id, n, pos) in debs:
+        info = by_key.get((d_id, pos), {"s1": None, "s2": None, "locked": False})
+        out.append({
+            "debate_id": d_id,
+            "number_in_round": n,
+            "position": pos,
+            "s1": info["s1"],
+            "s2": info["s2"],
+            "locked": info["locked"],
+        })
+    return out
+
+def _get_soc_context(sess):
+    """Retorna (edition_society, edition_id, base_society_id) da conta logada de sociedade."""
+    soc_acc_id = session.get("soc_acc_id")
+    edsoc_id = session.get("edition_society_id")
+    if not soc_acc_id or not edsoc_id:
+        return None, None, None
+    edsoc = sess.get(EditionSociety, edsoc_id)
+    if not edsoc:
+        return None, None, None
+    return edsoc, edsoc.edition_id, edsoc.society_id
+
+def _list_rounds_for_society(sess, edition_id, edition_society_id):
+    """Rodadas onde a sociedade participa (tem posição em algum debate)."""
+    rows = sess.execute(
+        select(Round.id, Round.number, Round.name, Round.scheduled_date)
+        .join(Debate, Debate.round_id == Round.id)
+        .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+        .where(
+            Round.edition_id == edition_id,
+            DebatePosition.edition_society_id == edition_society_id
+        )
+        .group_by(Round.id)
+        .order_by(Round.number.asc())
+    ).all()
+    return rows
+
+
+def _debates_of_round_for_soc(sess, round_id, edition_society_id):
+    """Debates da rodada onde esta sociedade participa, incluindo posição e escalação atual."""
+    # Debates + posição da sociedade
+    debs = sess.execute(
+        select(
+            Debate.id, Debate.number_in_round,
+            DebatePosition.position
+        )
+        .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+        .where(
+            Debate.round_id == round_id,
+            DebatePosition.edition_society_id == edition_society_id
+        )
+        .order_by(Debate.number_in_round.asc())
+    ).all()
+    deb_ids = [d_id for (d_id, _n, _p) in debs]
+
+    # Falas já cadastradas para esses debates/posições
+    # (podem estar sem score = escalação; score != NULL -> bloqueado)
+    sp_rows = []
+    if deb_ids:
+        sp_rows = sess.execute(
+            select(
+                Speech.debate_id, Speech.position, Speech.sequence_in_team,
+                Speech.score,
+                EditionMember.id.label("member_id"),
+                Person.full_name
+            )
+            .join(EditionMember, EditionMember.id == Speech.edition_member_id)
+            .join(Person, Person.id == EditionMember.person_id)
+            .where(Speech.debate_id.in_(deb_ids))
+            .order_by(Speech.debate_id.asc(), Speech.position.asc(), Speech.sequence_in_team.asc())
+        ).all()
+
+    # Agrupa por debate+posição
+    by_key = {}
+    for (d_id, pos, seq, score, mid, name) in sp_rows:
+        key = (d_id, pos)
+        by_key.setdefault(key, {"s1": None, "s2": None, "locked": False})
+        if seq == 1:
+            by_key[key]["s1"] = {"id": mid, "name": name}
+        elif seq == 2:
+            by_key[key]["s2"] = {"id": mid, "name": name}
+        if score is not None:
+            by_key[key]["locked"] = True
+
+    # Monta estrutura final
+    out = []
+    for (d_id, n, pos) in debs:
+        k = (d_id, pos)
+        info = by_key.get(k, {"s1": None, "s2": None, "locked": False})
+        out.append({
+            "debate_id": d_id,
+            "number_in_round": n,
+            "position": pos,
+            "s1": info["s1"],
+            "s2": info["s2"],
+            "locked": info["locked"],
+        })
+    return out
+
+from sqlalchemy import select, func, case, and_, or_, literal_column
+
+# conta quantas vezes um EditionMember já DEBATEU com nota (score != NULL) em rodadas anteriores da edição
+def _used_times_member(sess, member_id: int, edition_id: int, lt_round_number: int | None = None) -> int:
+    q = (
+        select(func.count(Speech.id))
+        .join(Debate, Debate.id == Speech.debate_id)
+        .join(Round, Round.id == Debate.round_id)
+        .where(
+            Speech.edition_member_id == member_id,
+            Speech.score.isnot(None),
+            Round.edition_id == edition_id
+        )
+    )
+    if lt_round_number is not None:
+        q = q.where(Round.number < lt_round_number)
+    return sess.execute(q).scalar_one()
+
+# lista de debatedores ELEGÍVEIS (< 4 usos em rodadas anteriores) para a próxima rodada
+def _eligible_debaters_for_next_round(sess, edition_id: int, base_society_id: int, next_round_number: int):
+    EM = aliased(EditionMember)
+
+    # quantas vezes ESTE membro já debateu (com nota) em rodadas anteriores
+    used_subq = (
+        select(func.count(Speech.id))
+        .join(Debate, Debate.id == Speech.debate_id)
+        .join(Round, Round.id == Debate.round_id)
+        .where(
+            Speech.edition_member_id == EM.id,   # <- referencia tipada
+            Speech.score.isnot(None),
+            Round.edition_id == edition_id,
+            Round.number < next_round_number,
+        )
+        .correlate(EM)                           # <- correlaciona ao alias EM
+        .scalar_subquery()
+    )
+
+    rows = sess.execute(
+        select(
+            EM.id,
+            Person.full_name,
+            used_subq.label("used_count"),
+        )
+        .join(Person, Person.id == EM.person_id)
+        .where(
+            EM.edition_id == edition_id,
+            EM.kind == "debater",                # <- comparação tipada com ENUM
+            Person.society_id == base_society_id,
+        )
+        .order_by(Person.full_name.asc())
+    ).all()
+
+    # filtra quem já debateu 4 vezes
+    return [{"id": mid, "name": name} for (mid, name, used) in rows if (used or 0) < 4]
+
+
+@app.get("/sociedade/<int:edsoc_id>")
+def view_society_history(edsoc_id: int):
+    sess = SessionLocal()
+    EM2 = aliased(EditionMember)
+    try:
+        edsoc = sess.get(EditionSociety, edsoc_id)
+        if not edsoc:
+            abort(404)
+        edition_id = edsoc.edition_id
+
+        # Dados básicos da sociedade
+        soc = sess.execute(
+            select(Society.short_name, Society.name).where(Society.id == edsoc.society_id)
+        ).first()
+        short_name, full_name = soc if soc else (None, None)
+
+        # --- Tabela de debatedores + contagem de vezes que debateram (score != NULL) na edição ---
+        used_subq_all = (
+            select(func.count(Speech.id))
+            .join(Debate, Debate.id == Speech.debate_id)
+            .join(Round, Round.id == Debate.round_id)
+            .where(
+                Speech.edition_member_id == EM2.id,
+                Speech.score.isnot(None),
+                Round.edition_id == edition_id,
+            )
+            .correlate(EM2)
+            .scalar_subquery()
+        )
+        deb_rows = sess.execute(
+            select(
+                EM2.id,
+                Person.full_name,
+                used_subq_all.label("used_count"),
+            )
+            .join(Person, Person.id == EM2.person_id)
+            .where(
+                EM2.edition_id == edition_id,
+                EM2.kind == "debater",
+                Person.society_id == edsoc.society_id,
+            )
+            .order_by(desc(used_subq_all))
+        ).all()
+        debaters_table = [{"id": mid, "name": name, "times": used or 0} for (mid, name, used) in deb_rows]
+
+        # --- Histórico: rodadas com o debate desta sociedade, posição, rank, e (se permitido) pontos ---
+        # 1) Debates da sociedade (rodada, número, debate, posição)
+        soc_debates = sess.execute(
+            select(
+                Round.id.label("round_id"), Round.number, Round.name, Round.scheduled_date,
+                Debate.id.label("debate_id"), Debate.number_in_round,
+                DebatePosition.position,
+                Round.scores_published, Round.silent,
+            )
+            .join(Debate, Debate.round_id == Round.id)
+            .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+            .where(
+                Round.edition_id == edition_id,
+                DebatePosition.edition_society_id == edsoc_id
+            )
+            .order_by(Round.number.asc(), Debate.number_in_round.asc())
+        ).all()
+
+        if not soc_debates:
+            return render_template(
+                "society_history.html",
+                society={"short": short_name, "full": full_name},
+                debaters=debaters_table,
+                history=[]
+            )
+
+        deb_ids = [row.debate_id for row in soc_debates]
+
+        # 2) Totais por posição (somatório das duas falas) para CADA debate
+        totals = sess.execute(
+            select(
+                Speech.debate_id, Speech.position,
+                func.sum(Speech.score).label("total")
+            )
+            .where(
+                Speech.debate_id.in_(deb_ids),
+                Speech.score.isnot(None)
+            )
+            .group_by(Speech.debate_id, Speech.position)
+        ).all()
+        totals_by_debate = {}
+        for d_id, pos, tot in totals:
+            totals_by_debate.setdefault(d_id, {})[pos] = int(tot)
+
+        # 3) Posições ↔ short_name de TODAS as equipes do debate (para contexto)
+        all_pos = sess.execute(
+            select(
+                DebatePosition.debate_id, DebatePosition.position,
+                Society.short_name
+            )
+            .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
+            .join(Society, Society.id == EditionSociety.society_id)
+            .where(DebatePosition.debate_id.in_(deb_ids))
+        ).all()
+        opp_by_debate = {}
+        for d_id, pos, sshort in all_pos:
+            opp_by_debate.setdefault(d_id, {})[pos] = sshort
+
+        # 4) Monta estrutura de histórico
+        history = []
+        for row in soc_debates:
+            d_totals = totals_by_debate.get(row.debate_id, {})
+            # rank: ordenar desc os totais; se faltar algum total, rank=None
+            rank = None
+            if len(d_totals) == 4 and all(v is not None for v in d_totals.values()):
+                order = sorted(d_totals.items(), key=lambda kv: kv[1], reverse=True)
+                rank_map = {pos: i+1 for i, (pos, _t) in enumerate(order)}
+                rank = rank_map.get(row.position)
+
+            # pontos por colocação (3/2/1/0)
+            points = {1: 3, 2: 2, 3: 1, 4: 0}.get(rank, None)
+
+            history.append({
+                "round_id": row.round_id,
+                "round_number": row.number,
+                "round_name": row.name,
+                "round_date": row.scheduled_date,
+                "scores_published": bool(row.scores_published),
+                "silent": bool(row.silent),
+                "debate_id": row.debate_id,
+                "deb_number": row.number_in_round,
+                "position": row.position,
+                "rank": rank,
+                "points": points,
+                "totals": d_totals,            # só mostrar se scores_published=True
+                "teams": opp_by_debate.get(row.debate_id, {}),
+            })
+
+        return render_template(
+            "society_history.html",
+            society={"short": short_name, "full": full_name},
+            debaters=debaters_table,
+            history=history
+        )
+    finally:
+        sess.close()
+
+
+# ---------- Página: Escalação (sociedade) ----------
+@app.get("/soc/escalacao")
+@society_required
+def page_escalacao():
+    sess = SessionLocal()
+    try:
+        edsoc, edition_id, base_soc_id = _get_soc_context(sess)
+        if not edsoc:
+            return redirect(url_for("login"))
+        next_round = _next_round_without_results(sess, edition_id)
+        if not next_round:
+            # não há rodada aberta para escalação
+            return render_template("escalacao.html",
+                                   next_round=None, debates=[], debaters=[])
+
+        debates = _debates_of_round_for_soc(sess, next_round["id"], edsoc.id)
+        debaters = _eligible_debaters_for_next_round(sess, edition_id, base_soc_id, next_round["number"])
+
+        return render_template("escalacao.html",
+                               next_round=next_round,
+                               debates=debates,
+                               debaters=debaters)
+    finally:
+        sess.close()
+
+@app.post("/soc/escalacao")
+@society_required
+def post_escalacao():
+    # ... (validações iguais às anteriores)
+    sess = SessionLocal()
+    try:
+        edsoc, edition_id, base_soc_id = _get_soc_context(sess)
+        # ... (checks iguais)
+        # upsert dos dois slots (score=None) iguais
+
+        sess.commit()
+        flash("Escalação salva com sucesso.", "success")
+        return redirect(url_for("home"))   # <— volta pra principal
+    finally:
+        sess.close()
 
 
 @app.get("/pairings")
@@ -313,30 +743,110 @@ def get_current_edition(sess):
     ).scalar_one_or_none()
 
 # --- Rotas de Login/Logout ---
+# @app.get("/login")
+# def login():
+#     return render_template("login.html")
+#
+# @app.post("/login")
+# def login_post():
+#     email = (request.form.get("email") or "").strip().lower()
+#     password = request.form.get("password") or ""
+#     sess = SessionLocal()
+#     try:
+#         user = sess.execute(select(User).where(User.email == email)).scalar_one_or_none()
+#         if not user or not check_password_hash(user.password_hash, password) or not user.is_active:
+#             flash("Credenciais inválidas.", "error")
+#             return redirect(url_for("login"))
+#         login_user(LoginUser(user))
+#         return redirect(url_for("home"))
+#     finally:
+#         sess.close()
+#
+# @app.post("/logout")
+# @login_required
+# def logout():
+#     logout_user()
+#     return redirect(url_for("home"))
+
+
+def get_db():  # se já usa SessionLocal(), ignore
+    return SessionLocal()
+
+def current_staff(sessdb):
+    uid = session.get("user_id")
+    if not uid or session.get("auth_kind") != "staff":
+        return None
+    return sessdb.get(User, uid)
+
+def current_society(sessdb):
+    sid = session.get("soc_acc_id")
+    if not sid or session.get("auth_kind") != "society":
+        return None
+    return sessdb.get(SocietyAccount, sid)
+
+# Mantém seu roles_required existente. Adicione:
+
+
+def login_required_any(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if session.get("auth_kind") in ("staff", "society"):
+            return f(*args, **kwargs)
+        return redirect(url_for("login", next=request.path))
+    return wrapper
+
+# ---------- Rotas de login/logout unificadas ----------
 @app.get("/login")
 def login():
-    return render_template("login.html")
+    return render_template("login_unified.html")
 
 @app.post("/login")
-def login_post():
+def do_login():
+    mode = (request.form.get("mode") or "staff").lower()  # 'staff' ou 'society'
     email = (request.form.get("email") or "").strip().lower()
     password = request.form.get("password") or ""
-    sess = SessionLocal()
+    nxt = request.args.get("next") or url_for("home")
+
+    if not email or not password:
+        flash("Informe e-mail e senha.", "error")
+        return redirect(url_for("login", next=nxt))
+
+    dbs = SessionLocal()
     try:
-        user = sess.execute(select(User).where(User.email == email)).scalar_one_or_none()
-        if not user or not check_password_hash(user.password_hash, password) or not user.is_active:
-            flash("Credenciais inválidas.", "error")
-            return redirect(url_for("login"))
-        login_user(LoginUser(user))
-        return redirect(url_for("home"))
+        if mode == "staff":
+            u = dbs.execute(
+                select(User).where(User.email == email, User.is_active == True)
+            ).scalar_one_or_none()
+            if not u or not check_password_hash(u.password_hash, password):
+                flash("E-mail ou senha inválidos.", "error")
+                return redirect(url_for("login", next=nxt))
+            session.clear()
+            session["auth_kind"] = "staff"
+            session["user_id"] = u.id
+            session["role"] = u.role
+            return redirect(nxt)
+
+        # mode == "society"
+        acc = dbs.execute(
+            select(SocietyAccount).where(SocietyAccount.email == email, SocietyAccount.is_active == True)
+        ).scalar_one_or_none()
+        if not acc or not check_password_hash(acc.password_hash, password):
+            flash("E-mail ou senha inválidos.", "error")
+            return redirect(url_for("login", next=nxt))
+        session.clear()
+        session["auth_kind"] = "society"
+        session["soc_acc_id"] = acc.id
+        session["edition_society_id"] = acc.edition_society_id
+        return redirect(nxt)
     finally:
-        sess.close()
+        dbs.close()
 
 @app.post("/logout")
-@login_required
 def logout():
-    logout_user()
-    return redirect(url_for("home"))
+    session.clear()
+    return redirect(url_for("login"))
+
+
 
 @app.get("/")
 def home():
@@ -706,6 +1216,7 @@ def api_standings():
             if short == "Independente":
                 continue
             agg[es_id] = {
+                "edsoc_id": es_id,
                 "society_id": s_id,
                 "short_name": short,
                 "points": 0,
