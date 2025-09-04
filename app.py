@@ -3,13 +3,13 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
-from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.security import check_password_hash
 from sqlalchemy import select, func, case, distinct
 from db import SessionLocal
 from models import (
     Edition, EditionSociety, Society,
     Round, Debate, DebatePosition, Speech,
-    EditionMember, Person, User, DebateJudge  # User vem do seu models.py
+    EditionMember, Person, User, DebateJudge
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -273,7 +273,7 @@ def view_results_list():
 
 
 class LoginUser(UserMixin):
-    """ Wrapper para integrar seu User do banco com Flask-Login """
+    """ Wrapper para integrar User do banco com Flask-Login """
     def __init__(self, db_user: User):
         self.id = str(db_user.id)
         self.email = db_user.email
@@ -705,9 +705,6 @@ def api_standings():
             short = (s_short or "").strip()
             if short == "Independente":
                 continue
-            if not short:
-                # fallback mínimo (evita string vazia)
-                short = f"S{s_id}"
             agg[es_id] = {
                 "society_id": s_id,
                 "short_name": short,
