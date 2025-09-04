@@ -703,6 +703,8 @@ def api_standings():
         agg = {}
         for es_id, s_id, s_short in esocs:
             short = (s_short or "").strip()
+            if short == "Independente":
+                continue
             if not short:
                 # fallback mínimo (evita string vazia)
                 short = f"S{s_id}"
