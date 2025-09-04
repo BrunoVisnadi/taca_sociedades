@@ -724,49 +724,25 @@ def load_user(user_id):
         sess.close()
 
 def roles_required(*roles):
-    """Decorator para exigir um ou mais papéis (ex.: 'director', 'admin')."""
-    def wrapper(fn):
-        @login_required
-        def inner(*args, **kwargs):
-            if getattr(current_user, "role", None) not in roles:
-                # 403 simples
+    def decorator(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            # precisa estar logado como staff
+            if session.get('auth_kind') != 'staff':
+                flash("Faça login como staff.", "error")
+                return redirect(url_for('login', next=request.path))
+            # precisa ter um dos papéis exigidos
+            user_role = session.get('role')
+            if roles and user_role not in roles:
                 return render_template("403.html"), 403
             return fn(*args, **kwargs)
-        # preserve attrs
-        inner.__name__ = fn.__name__
-        return inner
-    return wrapper
+        return wrapped
+    return decorator
 
 def get_current_edition(sess):
     return sess.execute(
         select(Edition).order_by(Edition.year.desc()).limit(1)
     ).scalar_one_or_none()
-
-# --- Rotas de Login/Logout ---
-# @app.get("/login")
-# def login():
-#     return render_template("login.html")
-#
-# @app.post("/login")
-# def login_post():
-#     email = (request.form.get("email") or "").strip().lower()
-#     password = request.form.get("password") or ""
-#     sess = SessionLocal()
-#     try:
-#         user = sess.execute(select(User).where(User.email == email)).scalar_one_or_none()
-#         if not user or not check_password_hash(user.password_hash, password) or not user.is_active:
-#             flash("Credenciais inválidas.", "error")
-#             return redirect(url_for("login"))
-#         login_user(LoginUser(user))
-#         return redirect(url_for("home"))
-#     finally:
-#         sess.close()
-#
-# @app.post("/logout")
-# @login_required
-# def logout():
-#     logout_user()
-#     return redirect(url_for("home"))
 
 
 def get_db():  # se já usa SessionLocal(), ignore
@@ -845,7 +821,6 @@ def do_login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
-
 
 
 @app.get("/")
