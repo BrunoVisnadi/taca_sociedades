@@ -304,20 +304,9 @@ def import_pairings_csv(path: str, default_edition_year: Optional[int] = None) -
         sess.close()
 
 
-def import_societies_provisorio():
+def import_societies_provisorio(socs):
     sess = SessionLocal()
-    socs = [
-        ["Sociedade de Debates da Universidade Federal de Santa Catarina", "SdDUFSC", "Florianópolis"],
-        ["Sociedade de Debates da Universidade Federal do Rio de Janeiro", "SDUFRJ", "Rio de Janeiro"],
-        ["Sociedade de Debates da Universidade Federal do Ceará", "SdDUFC", "Fortaleza"],
-        ["Sociedade de Debates Soteropolitana", "SDS", "Salvador"],
-        ["Senatus", "Senatus", "Belo Horizonte"],
-        ["Sociedade de Debates da Unifor", "SdDUNIFOR", "Fortaleza"],
-        ["Ágora", "Ágora", "Aracaju"],
-        ["Grupo de Debates e Oratória", "GDO", "Porto Alegre"],
-        ["Sociedade de Debates Potiguar", "SDP", "Natal"],
-        ["Sociedade de Debates da Universidade Estadual do Rio de Janeiro", "SDUERJ", "Rio de Janeiro"],
-        ]
+
     for name, short_name, city in socs:
         get_or_create_society(sess, name, short_name=short_name, city=city)
     sess.commit()
@@ -325,5 +314,9 @@ def import_societies_provisorio():
 
 if __name__ == "__main__":
     if 1:
+        # socs = [
+        #     ["Independente", "Independente", None],
+        # ]
+        # import_societies_provisorio(socs)
         import_members_csv("members2.csv", default_edition_year=2025)
         # import_pairings_csv("pairings.csv", default_edition_year=2025)
