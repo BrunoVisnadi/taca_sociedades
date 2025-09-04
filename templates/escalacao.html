@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Escalação • Taça das Sociedades</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-sky-50 to-white text-slate-800">
+  <header class="sticky top-0 z-20 backdrop-blur bg-white/70 border-b border-slate-200">
+    <div class="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <img src="{{ url_for('static', filename='taca.png') }}" class="h-10 w-10 object-contain" alt="Taça">
+        <h1 class="text-2xl font-bold text-sky-800">Escalação</h1>
+      </div>
+      <img src="{{ url_for('static', filename='condeb.png') }}" class="h-8 object-contain" alt="CONDEB">
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% if msgs %}
+        <div class="space-y-2">
+          {% for cat, msg in msgs %}
+            <div class="rounded-lg px-3 py-2 text-sm
+                        {{ 'bg-rose-50 text-rose-800 border border-rose-200' if cat=='error' else 'bg-emerald-50 text-emerald-800 border border-emerald-200' }}">
+              {{ msg }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    {% if round_info %}
+      <section class="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 space-y-4">
+        <div class="flex items-baseline justify-between">
+          <h2 class="text-xl font-semibold text-sky-900">Próxima rodada: #{{ round_info.number }} {{ round_info.name or '' }}</h2>
+          {% if round_info.date %}<div class="text-sm text-slate-600">Data: {{ round_info.date }}</div>{% endif %}
+        </div>
+
+        {% if debates and debates|length > 0 %}
+          <div class="grid md:grid-cols-2 gap-4">
+            {% for d in debates %}
+              <div class="rounded-2xl border border-slate-200 p-4 space-y-3">
+                <div class="flex items-center justify-between">
+                  <div class="text-slate-900 font-medium">Debate {{ d.number_in_round }} • Sua posição: <span class="font-semibold text-sky-800">{{ d.position }}</span></div>
+                  {% if d.locked %}
+                    <span class="text-xs rounded-md px-2 py-1 bg-slate-100 border border-slate-200 text-slate-700">Bloqueado (resultado já lançado)</span>
+                  {% endif %}
+                </div>
+
+                <form method="post" action="{{ url_for('post_escalacao') }}" class="grid grid-cols-1 gap-3 items-end">
+                  <input type="hidden" name="debate_id" value="{{ d.debate_id }}">
+
+                  <div class="grid md:grid-cols-2 gap-3">
+                    <div>
+                      <label class="block text-sm text-slate-700 mb-1">Debatedor A</label>
+                      <select name="s1_id" class="w-full rounded-lg border-slate-300" {{ 'disabled' if d.locked }}>
+                        <option value="">— selecione —</option>
+                        {% for m in debaters %}
+                          <option value="{{ m.id }}" {{ 'selected' if d.s1 and d.s1.id == m.id else '' }}>{{ m.name }}</option>
+                        {% endfor %}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label class="block text-sm text-slate-700 mb-1">Debatedor B</label>
+                      <select name="s2_id" class="w-full rounded-lg border-slate-300" {{ 'disabled' if d.locked }}>
+                        <option value="">— selecione —</option>
+                        {% for m in debaters %}
+                          <option value="{{ m.id }}" {{ 'selected' if d.s2 and d.s2.id == m.id else '' }}>{{ m.name }}</option>
+                        {% endfor %}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div>
+                    <button class="rounded-lg bg-sky-600 text-white px-4 py-2 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                            {{ 'disabled' if d.locked }}>
+                      Salvar escalação
+                    </button>
+                  </div>
+                </form>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="rounded-xl border border-slate-200 bg-slate-50 text-slate-700 px-4 py-3">
+            Sua sociedade não tem debate nesta rodada.
+          </div>
+        {% endif %}
+      </section>
+    {% else %}
+      <div class="rounded-xl border border-slate-200 bg-slate-50 text-slate-700 px-4 py-3">
+        Não há próxima rodada disponível para escalação no momento.
+      </div>
+    {% endif %}
+  </main>
+</body>
+</html>
