@@ -11,7 +11,7 @@
     <div class="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
       <div class="flex items-center gap-3">
         <img src="{{ url_for('static', filename='taca.png') }}" class="h-10 w-10 object-contain" alt="Taça">
-        <h1 class="text-2xl font-bold text-sky-800">Escalação</h1>
+        <h1 class="text-2xl font-bold text-sky-800">Resultados</h1>
       </div>
       <div class="flex items-center gap-2">
         <a href="{{ url_for('home') }}"
@@ -57,18 +57,31 @@
                       </div>
 
                       {% if speeches|length == 2 %}
-                        <div class="text-sm flex justify-between">
-                          <span>{{ speeches[0].name }}</span>
-                          <span class="font-medium">{{ speeches[0].score }}</span>
-                        </div>
-                        <div class="text-sm flex justify-between">
-                          <span>{{ speeches[1].name }}</span>
-                          <span class="font-medium">{{ speeches[1].score }}</span>
-                        </div>
-                        <div class="text-xs text-slate-700 mt-1">Total: {{ total }}</div>
+                        {% if r.scores_published %}
+                          <div class="text-sm flex justify-between">
+                            <span>{{ speeches[0].name }}</span>
+                            <span class="font-medium">{{ speeches[0].score }}</span>
+                          </div>
+                          <div class="text-sm flex justify-between">
+                            <span>{{ speeches[1].name }}</span>
+                            <span class="font-medium">{{ speeches[1].score }}</span>
+                          </div>
+                          <div class="text-xs text-slate-700 mt-1">Total: {{ total }}</div>
+                        {% else %}
+                          <div class="text-sm flex justify-between">
+                            <span>{{ speeches[0].name }}</span>
+                            <span class="font-medium text-slate-400">—</span>
+                          </div>
+                          <div class="text-sm flex justify-between">
+                            <span>{{ speeches[1].name }}</span>
+                            <span class="font-medium text-slate-400">—</span>
+                          </div>
+                          <div class="text-xs text-slate-400 mt-1">Speaker points não divulgados</div>
+                        {% endif %}
                       {% else %}
                         <div class="text-sm text-slate-500">Dados incompletos</div>
                       {% endif %}
+
                     </div>
                   {% endfor %}
                 </div>

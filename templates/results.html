@@ -11,7 +11,7 @@
     <div class="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
       <div class="flex items-center gap-3">
         <img src="{{ url_for('static', filename='taca.png') }}" class="h-10 w-10 object-contain" alt="Taça">
-        <h1 class="text-2xl font-bold text-sky-800">Escalação</h1>
+        <h1 class="text-2xl font-bold text-sky-800">Inserir resultados</h1>
       </div>
       <div class="flex items-center gap-2">
         <a href="{{ url_for('home') }}"
@@ -23,7 +23,6 @@
     </div>
   </header>
 
-
   <main class="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8 py-6 space-y-6">
     <div id="alert" class="hidden rounded-xl border border-amber-300 bg-amber-50 text-amber-900 px-4 py-3"></div>
 
@@ -32,6 +31,7 @@
         <div>
           <label class="block text-sm text-slate-700 mb-1">Rodada</label>
           <select id="round" class="w-full rounded-lg border-slate-300 focus:ring-sky-500 focus:border-sky-500">
+            <option value="">— selecione —</option>
             {% for r_id, r_num, r_name, r_completed in rounds %}
               <option value="{{ r_id }}">#{{ r_num }}{% if r_completed %} — Resultados já enviados{% endif %}</option>
             {% endfor %}
@@ -40,11 +40,8 @@
         <div>
           <label class="block text-sm text-slate-700 mb-1">Debate</label>
           <select id="debate" class="w-full rounded-lg border-slate-300 focus:ring-sky-500 focus:border-sky-500">
-            {% for d in debates %}
-              <option value="{{ d.id }}">
-                Debate {{ d.number_in_round }}{% if d.completed %} — resultados enviados{% endif %}
-              </option>
-            {% endfor %}
+            <option value="">— selecione —</option>
+            {# Sem seleção inicial de debates #}
           </select>
         </div>
       </div>
@@ -72,12 +69,11 @@
                  disabled:opacity-50 disabled:cursor-not-allowed">
           Salvar resultados
         </button>
-
         <a href="/" class="rounded-lg border border-slate-300 px-4 py-2 text-slate-700">Voltar</a>
       </div>
     </div>
   </main>
 
-<script type="module" src="{{ url_for('static', filename='js/results.js') }}?v=1"></script>
+  <script type="module" src="{{ url_for('static', filename='js/results.js') }}?v=3"></script>
 </body>
 </html>

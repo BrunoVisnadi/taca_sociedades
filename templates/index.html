@@ -52,7 +52,12 @@
             Escalação
           </a>
         {% endif %}
-
+        {% if session.get('auth_kind') == 'staff' and session.get('role') in ['director','admin'] %}
+          <a href="{{ url_for('admin_panel') }}"
+             class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent">
+            Painel de administração
+          </a>
+        {% endif %}
         {% if session.get('auth_kind') in ['staff','society'] %}
           <form method="post" action="/logout">
             <button class="flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 hover:text-sky-900 hover:bg-slate-100 border border-transparent">Sair</button>

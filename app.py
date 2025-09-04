@@ -3,16 +3,17 @@ from pathlib import Path
 from functools import wraps
 
 from flask import Flask, jsonify, render_template, request, redirect, url_for, flash, session, abort
-from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
+from flask_login import LoginManager, UserMixin
 from werkzeug.security import check_password_hash
-from sqlalchemy import select, func, case, distinct, exists, desc
+from sqlalchemy import cast, literal, case, distinct, desc, exists, select, func, case, and_
 from sqlalchemy.orm import aliased
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from db import SessionLocal
 from models import (
     Edition, EditionSociety, Society,
     Round, Debate, DebatePosition, Speech,
     EditionMember, Person, User, DebateJudge,
-    SocietyAccount
+    SocietyAccount, MemberKindEnum, JudgeRoleEnum
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,7 +28,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     # Em produção:
-    # SESSION_COOKIE_SECURE=True  # se seu domínio usa HTTPS (Render usa)
+    SESSION_COOKIE_SECURE=True  # se seu domínio usa HTTPS (Render usa)
 )
 app.secret_key = os.environ.get("SECRET_KEY", "dev-unsafe")
 
@@ -52,9 +53,16 @@ def society_required(f):
     return wrapper
 
 def _next_round_without_results(sess, edition_id: int):
-    # conta quantas speeches têm score NÃO nulo por rodada
-    scored_count = func.count(
-        case((Speech.score.isnot(None), 1))
+    # subconsulta correlacionada: existe algum speech com score na rodada?
+    any_scored = (
+        select(literal(1))
+        .select_from(Speech)
+        .join(Debate, Debate.id == Speech.debate_id)
+        .where(
+            Debate.round_id == Round.id,     # correlaciona com Round externo
+            Speech.score.is_not(None),
+        )
+        .limit(1)
     )
 
     row = sess.execute(
@@ -63,78 +71,19 @@ def _next_round_without_results(sess, edition_id: int):
             Round.number,
             Round.name,
             Round.scheduled_date,
-            scored_count.label("scored_count"),
         )
-        .select_from(Round)
-        .join(Debate, Debate.round_id == Round.id, isouter=True)
-        .join(Speech, Speech.debate_id == Debate.id, isouter=True)
-        .where(Round.edition_id == edition_id)
-        .group_by(Round.id)
-        .having(scored_count == 0)           # <-- nenhuma nota lançada na rodada
+        .where(
+            Round.edition_id == edition_id,
+            ~exists(any_scored)              # NÃO existe score lançado
+        )
         .order_by(Round.number.asc(), Round.id.asc())
         .limit(1)
     ).first()
 
     if not row:
         return None
-    r_id, r_num, r_name, r_date, _ = row
+    r_id, r_num, r_name, r_date = row
     return {"id": r_id, "number": r_num, "name": r_name, "date": r_date}
-
-
-# -------- debates/posição desta sociedade + escalação atual (mesmo que sem notas) --------
-def _debates_of_round_for_soc(sess, round_id: int, edition_society_id: int):
-    debs = sess.execute(
-        select(
-            Debate.id, Debate.number_in_round,
-            DebatePosition.position
-        )
-        .join(DebatePosition, DebatePosition.debate_id == Debate.id)
-        .where(
-            Debate.round_id == round_id,
-            DebatePosition.edition_society_id == edition_society_id
-        )
-        .order_by(Debate.number_in_round.asc())
-    ).all()
-    deb_ids = [d_id for (d_id, _n, _p) in debs]
-
-    sp_rows = []
-    if deb_ids:
-        sp_rows = sess.execute(
-            select(
-                Speech.debate_id, Speech.position, Speech.sequence_in_team,
-                Speech.score,
-                EditionMember.id.label("member_id"),
-                Person.full_name
-            )
-            .join(EditionMember, EditionMember.id == Speech.edition_member_id)
-            .join(Person, Person.id == EditionMember.person_id)
-            .where(Speech.debate_id.in_(deb_ids))
-            .order_by(Speech.debate_id.asc(), Speech.position.asc(), Speech.sequence_in_team.asc())
-        ).all()
-
-    by_key = {}
-    for (d_id, pos, seq, score, mid, name) in sp_rows:
-        key = (d_id, pos)
-        by_key.setdefault(key, {"s1": None, "s2": None, "locked": False})
-        if seq == 1:
-            by_key[key]["s1"] = {"id": mid, "name": name}
-        elif seq == 2:
-            by_key[key]["s2"] = {"id": mid, "name": name}
-        if score is not None:
-            by_key[key]["locked"] = True  # já tem nota => bloqueado
-
-    out = []
-    for (d_id, n, pos) in debs:
-        info = by_key.get((d_id, pos), {"s1": None, "s2": None, "locked": False})
-        out.append({
-            "debate_id": d_id,
-            "number_in_round": n,
-            "position": pos,
-            "s1": info["s1"],
-            "s2": info["s2"],
-            "locked": info["locked"],
-        })
-    return out
 
 def _get_soc_context(sess):
     """Retorna (edition_society, edition_id, base_society_id) da conta logada de sociedade."""
@@ -147,280 +96,95 @@ def _get_soc_context(sess):
         return None, None, None
     return edsoc, edsoc.edition_id, edsoc.society_id
 
-def _list_rounds_for_society(sess, edition_id, edition_society_id):
-    """Rodadas onde a sociedade participa (tem posição em algum debate)."""
+
+def _debates_of_round_for_soc(sess, round_id: int, edition_society_id: int):
     rows = sess.execute(
-        select(Round.id, Round.number, Round.name, Round.scheduled_date)
-        .join(Debate, Debate.round_id == Round.id)
-        .join(DebatePosition, DebatePosition.debate_id == Debate.id)
-        .where(
-            Round.edition_id == edition_id,
-            DebatePosition.edition_society_id == edition_society_id
-        )
-        .group_by(Round.id)
-        .order_by(Round.number.asc())
-    ).all()
-    return rows
-
-
-def _debates_of_round_for_soc(sess, round_id, edition_society_id):
-    """Debates da rodada onde esta sociedade participa, incluindo posição e escalação atual."""
-    # Debates + posição da sociedade
-    debs = sess.execute(
         select(
-            Debate.id, Debate.number_in_round,
-            DebatePosition.position
+            Debate.id.label("debate_id"),
+            Debate.number_in_round.label("number_in_round"),
+            DebatePosition.position.label("position"),
+            # locked = existe algum score não-nulo nesse slot (posição do nosso time)
+            func.bool_or(Speech.score.is_not(None)).label("locked"),
+            # lineup ordenado por seq: [{id, name, seq, score}, ...]
+            func.json_agg(
+                aggregate_order_by(
+                    func.json_build_object(
+                        literal("id"), EditionMember.id,
+                        literal("name"), Person.full_name,
+                        literal("seq"), Speech.sequence_in_team,
+                        literal("score"), Speech.score,
+                    ),
+                    Speech.sequence_in_team.asc(),
+                )
+            ).label("lineup_json"),
         )
-        .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+        .select_from(DebatePosition)
+        .join(Debate, Debate.id == DebatePosition.debate_id)
+        .outerjoin(
+            Speech,
+            (Speech.debate_id == Debate.id) &
+            (Speech.position == DebatePosition.position)
+        )
+        .outerjoin(EditionMember, EditionMember.id == Speech.edition_member_id)
+        .outerjoin(Person, Person.id == EditionMember.person_id)
         .where(
             Debate.round_id == round_id,
-            DebatePosition.edition_society_id == edition_society_id
+            DebatePosition.edition_society_id == edition_society_id,
         )
-        .order_by(Debate.number_in_round.asc())
+        .group_by(Debate.id, Debate.number_in_round, DebatePosition.position)
+        .order_by(Debate.number_in_round.asc(), DebatePosition.position.asc())
     ).all()
-    deb_ids = [d_id for (d_id, _n, _p) in debs]
 
-    # Falas já cadastradas para esses debates/posições
-    # (podem estar sem score = escalação; score != NULL -> bloqueado)
-    sp_rows = []
-    if deb_ids:
-        sp_rows = sess.execute(
-            select(
-                Speech.debate_id, Speech.position, Speech.sequence_in_team,
-                Speech.score,
-                EditionMember.id.label("member_id"),
-                Person.full_name
-            )
-            .join(EditionMember, EditionMember.id == Speech.edition_member_id)
-            .join(Person, Person.id == EditionMember.person_id)
-            .where(Speech.debate_id.in_(deb_ids))
-            .order_by(Speech.debate_id.asc(), Speech.position.asc(), Speech.sequence_in_team.asc())
-        ).all()
-
-    # Agrupa por debate+posição
-    by_key = {}
-    for (d_id, pos, seq, score, mid, name) in sp_rows:
-        key = (d_id, pos)
-        by_key.setdefault(key, {"s1": None, "s2": None, "locked": False})
-        if seq == 1:
-            by_key[key]["s1"] = {"id": mid, "name": name}
-        elif seq == 2:
-            by_key[key]["s2"] = {"id": mid, "name": name}
-        if score is not None:
-            by_key[key]["locked"] = True
-
-    # Monta estrutura final
     out = []
-    for (d_id, n, pos) in debs:
-        k = (d_id, pos)
-        info = by_key.get(k, {"s1": None, "s2": None, "locked": False})
+    for d_id, num, pos, locked, lineup_json in rows:
+        s1 = s2 = None
+        if lineup_json:
+            # lineup_json já vem ordenado por seq
+            if len(lineup_json) >= 1:
+                s1 = {"id": lineup_json[0]["id"], "name": lineup_json[0]["name"]}
+            if len(lineup_json) >= 2:
+                s2 = {"id": lineup_json[1]["id"], "name": lineup_json[1]["name"]}
         out.append({
             "debate_id": d_id,
-            "number_in_round": n,
+            "number_in_round": num,
             "position": pos,
-            "s1": info["s1"],
-            "s2": info["s2"],
-            "locked": info["locked"],
+            "s1": s1,
+            "s2": s2,
+            "locked": bool(locked),
         })
     return out
-
-from sqlalchemy import select, func, case, and_, or_, literal_column
-
-# conta quantas vezes um EditionMember já DEBATEU com nota (score != NULL) em rodadas anteriores da edição
-def _used_times_member(sess, member_id: int, edition_id: int, lt_round_number: int | None = None) -> int:
-    q = (
-        select(func.count(Speech.id))
-        .join(Debate, Debate.id == Speech.debate_id)
-        .join(Round, Round.id == Debate.round_id)
-        .where(
-            Speech.edition_member_id == member_id,
-            Speech.score.isnot(None),
-            Round.edition_id == edition_id
-        )
-    )
-    if lt_round_number is not None:
-        q = q.where(Round.number < lt_round_number)
-    return sess.execute(q).scalar_one()
-
 # lista de debatedores ELEGÍVEIS (< 4 usos em rodadas anteriores) para a próxima rodada
 def _eligible_debaters_for_next_round(sess, edition_id: int, base_society_id: int, next_round_number: int):
     EM = aliased(EditionMember)
 
-    # quantas vezes ESTE membro já debateu (com nota) em rodadas anteriores
-    used_subq = (
-        select(func.count(Speech.id))
-        .join(Debate, Debate.id == Speech.debate_id)
-        .join(Round, Round.id == Debate.round_id)
-        .where(
-            Speech.edition_member_id == EM.id,   # <- referencia tipada
-            Speech.score.isnot(None),
-            Round.edition_id == edition_id,
-            Round.number < next_round_number,
-        )
-        .correlate(EM)                           # <- correlaciona ao alias EM
-        .scalar_subquery()
-    )
+    used_count = func.count(Speech.id).filter(
+        (Speech.score.is_not(None))
+        & (Round.edition_id == edition_id)
+        & (Round.number < next_round_number)
+    ).label("used_count")
 
     rows = sess.execute(
         select(
             EM.id,
             Person.full_name,
-            used_subq.label("used_count"),
+            used_count,
         )
+        .select_from(EM)
         .join(Person, Person.id == EM.person_id)
+        # JOINs para contar usos anteriores; LEFT para permitir 0
+        .outerjoin(Speech, Speech.edition_member_id == EM.id)
+        .outerjoin(Debate, Debate.id == Speech.debate_id)
+        .outerjoin(Round, Round.id == Debate.round_id)
         .where(
             EM.edition_id == edition_id,
-            EM.kind == "debater",                # <- comparação tipada com ENUM
+            EM.kind == cast(literal("debater"), MemberKindEnum),   # enum OK
             Person.society_id == base_society_id,
         )
+        .group_by(EM.id, Person.full_name)
         .order_by(Person.full_name.asc())
     ).all()
 
-    # filtra quem já debateu 4 vezes
-    return [{"id": mid, "name": name} for (mid, name, used) in rows if (used or 0) < 4]
-
-
-@app.get("/sociedade/<int:edsoc_id>")
-def view_society_history(edsoc_id: int):
-    sess = SessionLocal()
-    EM2 = aliased(EditionMember)
-    try:
-        edsoc = sess.get(EditionSociety, edsoc_id)
-        if not edsoc:
-            abort(404)
-        edition_id = edsoc.edition_id
-
-        # Dados básicos da sociedade
-        soc = sess.execute(
-            select(Society.short_name, Society.name).where(Society.id == edsoc.society_id)
-        ).first()
-        short_name, full_name = soc if soc else (None, None)
-
-        # --- Tabela de debatedores + contagem de vezes que debateram (score != NULL) na edição ---
-        used_subq_all = (
-            select(func.count(Speech.id))
-            .join(Debate, Debate.id == Speech.debate_id)
-            .join(Round, Round.id == Debate.round_id)
-            .where(
-                Speech.edition_member_id == EM2.id,
-                Speech.score.isnot(None),
-                Round.edition_id == edition_id,
-            )
-            .correlate(EM2)
-            .scalar_subquery()
-        )
-        deb_rows = sess.execute(
-            select(
-                EM2.id,
-                Person.full_name,
-                used_subq_all.label("used_count"),
-            )
-            .join(Person, Person.id == EM2.person_id)
-            .where(
-                EM2.edition_id == edition_id,
-                EM2.kind == "debater",
-                Person.society_id == edsoc.society_id,
-            )
-            .order_by(desc(used_subq_all))
-        ).all()
-        debaters_table = [{"id": mid, "name": name, "times": used or 0} for (mid, name, used) in deb_rows]
-
-        # --- Histórico: rodadas com o debate desta sociedade, posição, rank, e (se permitido) pontos ---
-        # 1) Debates da sociedade (rodada, número, debate, posição)
-        soc_debates = sess.execute(
-            select(
-                Round.id.label("round_id"), Round.number, Round.name, Round.scheduled_date,
-                Debate.id.label("debate_id"), Debate.number_in_round,
-                DebatePosition.position,
-                Round.scores_published, Round.silent,
-            )
-            .join(Debate, Debate.round_id == Round.id)
-            .join(DebatePosition, DebatePosition.debate_id == Debate.id)
-            .where(
-                Round.edition_id == edition_id,
-                DebatePosition.edition_society_id == edsoc_id
-            )
-            .order_by(Round.number.asc(), Debate.number_in_round.asc())
-        ).all()
-
-        if not soc_debates:
-            return render_template(
-                "society_history.html",
-                society={"short": short_name, "full": full_name},
-                debaters=debaters_table,
-                history=[]
-            )
-
-        deb_ids = [row.debate_id for row in soc_debates]
-
-        # 2) Totais por posição (somatório das duas falas) para CADA debate
-        totals = sess.execute(
-            select(
-                Speech.debate_id, Speech.position,
-                func.sum(Speech.score).label("total")
-            )
-            .where(
-                Speech.debate_id.in_(deb_ids),
-                Speech.score.isnot(None)
-            )
-            .group_by(Speech.debate_id, Speech.position)
-        ).all()
-        totals_by_debate = {}
-        for d_id, pos, tot in totals:
-            totals_by_debate.setdefault(d_id, {})[pos] = int(tot)
-
-        # 3) Posições ↔ short_name de TODAS as equipes do debate (para contexto)
-        all_pos = sess.execute(
-            select(
-                DebatePosition.debate_id, DebatePosition.position,
-                Society.short_name
-            )
-            .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
-            .join(Society, Society.id == EditionSociety.society_id)
-            .where(DebatePosition.debate_id.in_(deb_ids))
-        ).all()
-        opp_by_debate = {}
-        for d_id, pos, sshort in all_pos:
-            opp_by_debate.setdefault(d_id, {})[pos] = sshort
-
-        # 4) Monta estrutura de histórico
-        history = []
-        for row in soc_debates:
-            d_totals = totals_by_debate.get(row.debate_id, {})
-            # rank: ordenar desc os totais; se faltar algum total, rank=None
-            rank = None
-            if len(d_totals) == 4 and all(v is not None for v in d_totals.values()):
-                order = sorted(d_totals.items(), key=lambda kv: kv[1], reverse=True)
-                rank_map = {pos: i+1 for i, (pos, _t) in enumerate(order)}
-                rank = rank_map.get(row.position)
-
-            # pontos por colocação (3/2/1/0)
-            points = {1: 3, 2: 2, 3: 1, 4: 0}.get(rank, None)
-
-            history.append({
-                "round_id": row.round_id,
-                "round_number": row.number,
-                "round_name": row.name,
-                "round_date": row.scheduled_date,
-                "scores_published": bool(row.scores_published),
-                "silent": bool(row.silent),
-                "debate_id": row.debate_id,
-                "deb_number": row.number_in_round,
-                "position": row.position,
-                "rank": rank,
-                "points": points,
-                "totals": d_totals,            # só mostrar se scores_published=True
-                "teams": opp_by_debate.get(row.debate_id, {}),
-            })
-
-        return render_template(
-            "society_history.html",
-            society={"short": short_name, "full": full_name},
-            debaters=debaters_table,
-            history=history
-        )
-    finally:
-        sess.close()
+    return [{"id": mid, "name": name} for (mid, name, used) in rows if int(used or 0) < 4]
 
 
 # ---------- Página: Escalação (sociedade) ----------
@@ -447,6 +211,266 @@ def page_escalacao():
                                debaters=debaters)
     finally:
         sess.close()
+
+
+@app.get("/sociedade/<int:edsoc_id>")
+def view_society_history(edsoc_id: int):
+    sess = SessionLocal()
+    EM2 = aliased(EditionMember)
+    try:
+        # 0) EditionSociety + Society nomes (uma ida só)
+        edsoc_row = sess.execute(
+            select(
+                EditionSociety.id,
+                EditionSociety.edition_id,
+                EditionSociety.society_id,
+                Society.short_name,
+                Society.name
+            ).join(Society, Society.id == EditionSociety.society_id
+            ).where(EditionSociety.id == edsoc_id)
+        ).first()
+
+        if not edsoc_row:
+            abort(404)
+
+        _, edition_id, society_id, short_name, full_name = edsoc_row
+
+        # 1) Debatedores da sociedade na edição + contagem de usos (scores não-nulos)
+        #    LEFT JOIN em Speech/Debate/Round permite "0" usos naturalmente
+        used_count = func.count(Speech.id).filter(Speech.score.is_not(None)).label("used_count")
+
+        deb_rows = sess.execute(
+            select(
+                EM2.id.label("member_id"),
+                Person.full_name,
+                used_count,
+            )
+            .join(Person, Person.id == EM2.person_id)
+            .outerjoin(Speech, Speech.edition_member_id == EM2.id)
+            .outerjoin(Debate, Debate.id == Speech.debate_id)
+            .outerjoin(Round, Round.id == Debate.round_id)
+            .where(
+                EM2.edition_id == edition_id,
+                EM2.kind == cast(literal("debater"), MemberKindEnum),
+                Person.society_id == society_id,
+                # conta apenas falas desta edição; permite None para quem não falou
+                (Round.edition_id == edition_id) | (Round.id.is_(None)),
+            )
+            .group_by(EM2.id, Person.full_name)
+            .order_by(desc(used_count))
+        ).all()
+
+        debaters_table = [
+            {"id": mid, "name": name, "times": int(used or 0)}
+            for (mid, name, used) in deb_rows
+        ]
+
+        # 2) HISTÓRICO em uma query com CTEs (debates, rank, mapas e speakers)
+        # our_debates: debates da sociedade na edição corrente
+        our_debates = (
+            select(
+                Round.id.label("round_id"),
+                Round.number.label("round_number"),
+                Round.name.label("round_name"),
+                Round.scheduled_date.label("round_date"),
+                Round.scores_published.label("scores_published"),
+                Round.silent.label("silent"),
+                Debate.id.label("debate_id"),
+                Debate.number_in_round.label("debate_number"),
+                DebatePosition.position.label("our_position"),
+            )
+            .join(Debate, Debate.round_id == Round.id)
+            .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+            .where(
+                Round.edition_id == edition_id,
+                DebatePosition.edition_society_id == edsoc_id,
+            )
+            .cte("our_debates")
+        )
+
+        # team_scores: soma por (debate, equipe) quando houver 2 discursos com nota
+        # mapeia equipe via DebatePosition (por posição), garantindo edição/silent já filtrados no join de Round
+        team_scores = (
+            select(
+                Speech.debate_id.label("debate_id"),
+                DebatePosition.edition_society_id.label("es_id"),
+                func.sum(Speech.score).label("team_total"),
+                func.count(Speech.id).label("speech_count"),
+            )
+            .join(Debate, Debate.id == Speech.debate_id)
+            .join(Round, Round.id == Debate.round_id)
+            .join(
+                DebatePosition,
+                and_(
+                    DebatePosition.debate_id == Speech.debate_id,
+                    DebatePosition.position == Speech.position,
+                ),
+            )
+            .where(
+                Round.edition_id == edition_id,
+                Speech.score.is_not(None),
+            )
+            .group_by(Speech.debate_id, DebatePosition.edition_society_id)
+            .having(func.count(Speech.id) == 2)  # exige 2 discursos com nota
+            .cte("team_scores")
+        )
+
+        # ranked: rank por debate (3/2/1/0 será mapeado depois)
+        ranked = (
+            select(
+                team_scores.c.debate_id,
+                team_scores.c.es_id,
+                team_scores.c.team_total,
+                func.rank().over(
+                    partition_by=team_scores.c.debate_id,
+                    order_by=team_scores.c.team_total.desc(),
+                ).label("rnk"),
+            )
+        ).cte("ranked")
+
+        # our_rank: rank/points do nosso time em cada debate (LEFT JOIN para casos sem 2 falas)
+        points_expr = case(
+            (ranked.c.rnk == 1, literal(3)),
+            (ranked.c.rnk == 2, literal(2)),
+            (ranked.c.rnk == 3, literal(1)),
+            else_=literal(0),
+        )
+
+        our_rank = (
+            select(
+                ranked.c.debate_id,
+                ranked.c.rnk,
+                points_expr.label("points"),
+                ranked.c.team_total.label("our_total"),
+            )
+            .where(ranked.c.es_id == edsoc_id)
+        ).cte("our_rank")
+
+        # teams_map: por debate, position->short_name (todas as equipes do debate)
+        teams_map = (
+            select(
+                DebatePosition.debate_id.label("debate_id"),
+                func.jsonb_object_agg(
+                    DebatePosition.position,
+                    Society.short_name
+                ).label("teams_json")
+            )
+            .select_from(DebatePosition)  # <-- define o FROM
+            .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
+            .join(Society, Society.id == EditionSociety.society_id)
+            .group_by(DebatePosition.debate_id)
+        ).cte("teams_map")
+
+        # totals_map: por debate, position->total (somente quando time tem 2 falas)
+        totals_map = (
+            select(
+                DebatePosition.debate_id.label("debate_id"),
+                func.jsonb_object_agg(
+                    DebatePosition.position,
+                    team_scores.c.team_total
+                ).label("totals_json")
+            )
+            .select_from(DebatePosition)  # <-- define o FROM
+            .join(
+                team_scores,
+                DebatePosition.edition_society_id == team_scores.c.es_id
+            )
+            .group_by(DebatePosition.debate_id)
+        ).cte("totals_map")
+
+        # our_speakers: nomes + score, ordenados por sequence_in_team (sempre retornamos nomes; score pode ser NULL)
+        our_speakers = (
+            select(
+                Speech.debate_id.label("debate_id"),
+                func.json_agg(
+                    aggregate_order_by(
+                        func.json_build_object(
+                            literal("name"), Person.full_name,
+                            literal("score"), Speech.score,
+                        ),
+                        Speech.sequence_in_team.asc(),  # <— ordena dentro do json_agg
+                    )
+                ).label("speakers_json")
+            )
+            .select_from(Speech)  # define FROM explícito p/ evitar ambiguidade no JOIN
+            .join(EditionMember, EditionMember.id == Speech.edition_member_id)
+            .join(Person, Person.id == EditionMember.person_id)
+            .join(
+                DebatePosition,
+                and_(
+                    DebatePosition.debate_id == Speech.debate_id,
+                    DebatePosition.position == Speech.position,
+                )
+            )
+            .where(DebatePosition.edition_society_id == edsoc_id)
+            .group_by(Speech.debate_id)
+        ).cte("our_speakers")
+
+        # SELECT final: uma linha por debate nosso, com mapas JSON prontos
+        history_rows = sess.execute(
+            select(
+                our_debates.c.round_id,
+                our_debates.c.round_number,
+                our_debates.c.round_name,
+                our_debates.c.round_date,
+                our_debates.c.scores_published,
+                our_debates.c.silent,
+                our_debates.c.debate_id,
+                our_debates.c.debate_number,
+                our_debates.c.our_position,
+
+                our_rank.c.rnk,
+                our_rank.c.points,
+                our_rank.c.our_total,
+
+                teams_map.c.teams_json,
+                totals_map.c.totals_json,
+                our_speakers.c.speakers_json,
+            )
+            .join(our_rank, our_rank.c.debate_id == our_debates.c.debate_id, isouter=True)
+            .join(teams_map, teams_map.c.debate_id == our_debates.c.debate_id, isouter=True)
+            .join(totals_map, totals_map.c.debate_id == our_debates.c.debate_id, isouter=True)
+            .join(our_speakers, our_speakers.c.debate_id == our_debates.c.debate_id, isouter=True)
+            .order_by(our_debates.c.round_number.asc(), our_debates.c.debate_number.asc())
+        ).all()
+
+        # Montagem final (aplica regra de exibição de totals somente quando published)
+        history = []
+        for (round_id, rnum, rname, rdate, published, silent,
+             debate_id, dnum, our_pos, rnk, pts, our_total,
+             teams_json, totals_json, speakers_json) in history_rows:
+
+            # se não publicados, não exibimos totals (mas mantemos structure vazia)
+            totals_map_py = totals_json if published else None
+
+            history.append({
+                "round_id": round_id,
+                "round_number": rnum,
+                "round_name": rname,
+                "round_date": rdate,
+                "scores_published": bool(published),
+                "silent": bool(silent),
+                "debate_id": debate_id,
+                "deb_number": dnum,
+                "position": our_pos,
+                "rank": int(rnk) if rnk is not None else None,
+                "points": int(pts) if pts is not None else None,
+                "totals": totals_map_py,           # dict position->total, ou None se não publicado
+                "teams": teams_json or {},         # dict position->short_name
+                "our_speakers": speakers_json or []  # [{name, score}], score pode ser NULL
+            })
+
+        return render_template(
+            "society_history.html",
+            society={"short": short_name, "full": full_name},
+            debaters=debaters_table,
+            history=history
+        )
+
+    finally:
+        sess.close()
+
+
 
 @app.post("/soc/escalacao")
 @society_required
@@ -545,35 +569,38 @@ def view_results_list():
         if not edition:
             return render_template("results_list.html", rounds=[])
 
-        # Rodadas completas (todas com 8 speeches por debate), não-silent
-        # total_speeches == 8 * num_debates   e   num_debates > 0
+        # 1) Rodadas completas, não-silent (1 query)
         r_rows = sess.execute(
             select(
-                Round.id, Round.number, Round.name, Round.scheduled_date,
+                Round.id,
+                Round.number,
+                Round.name,
+                Round.scheduled_date,
+                Round.scores_published,
                 func.count(distinct(Debate.id)).label("deb_count"),
                 func.count(Speech.id).label("sp_total"),
             )
             .join(Debate, Debate.round_id == Round.id, isouter=True)
             .join(Speech, Speech.debate_id == Debate.id, isouter=True)
-            .where(Round.edition_id == edition.id, Round.silent == False)
+            .where(Round.edition_id == edition.id, Round.silent.is_(False))
             .group_by(Round.id)
             .having(func.count(distinct(Debate.id)) > 0)
             .having(func.count(Speech.id) == 8 * func.count(distinct(Debate.id)))
             .order_by(Round.number.asc())
         ).all()
-        round_ids = [r_id for (r_id, *_rest) in r_rows]
 
+        round_ids = [r_id for (r_id, *_rest) in r_rows]
         if not round_ids:
             return render_template("results_list.html", rounds=[])
 
-        # Posições (sociedades) por debate
-        debates_sq = (
-            select(Debate.id)
-            .where(Debate.round_id.in_(round_ids))
-            .subquery()
+        # Preparar CASE p/ ordenar posições
+        ORDER_POS = case(
+            (DebatePosition.position == "OG", 1),
+            (DebatePosition.position == "OO", 2),
+            (DebatePosition.position == "CG", 3),
+            (DebatePosition.position == "CO", 4),
+            else_=99,
         )
-
-        # CASE para ordenar por posição nas falas
         ORDER_POS_SPEECH = case(
             (Speech.position == "OG", 1),
             (Speech.position == "OO", 2),
@@ -582,125 +609,202 @@ def view_results_list():
             else_=99,
         )
 
-        # Posições (sociedades) por debate  — OK como estava
-        pos = sess.execute(
+        # Subquery: posições (sociedade por posição) agregadas por debate
+        positions_subq = (
             select(
-                Debate.id.label("debate_id"),
-                Debate.number_in_round,
-                Debate.round_id,
-                DebatePosition.position,
-                Society.short_name,
+                DebatePosition.debate_id.label("debate_id"),
+                func.json_agg(
+                    aggregate_order_by(
+                        func.json_build_object(
+                            literal("position"), DebatePosition.position,
+                            literal("short_name"), Society.short_name,
+                        ),
+                        ORDER_POS.asc(),
+                    )
+                ).label("positions_json"),
             )
-            .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+            .select_from(DebatePosition)
             .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
             .join(Society, Society.id == EditionSociety.society_id)
-            .where(Debate.round_id.in_(round_ids))
-            .order_by(Debate.round_id.asc(), Debate.number_in_round.asc(), ORDER_POS.asc())
-        ).all()
+            .group_by(DebatePosition.debate_id)
+        ).subquery()
 
-        # Speeches (pessoas + notas) — usa subquery em .in_ e ORDER_POS_SPEECH
-        sp = sess.execute(
+        # Subquery: speeches agregados por debate, ordenados por posição e seq
+        speeches_subq = (
             select(
-                Speech.debate_id, Speech.position, Speech.sequence_in_team,
-                Speech.score,
-                Person.full_name
+                Speech.debate_id.label("debate_id"),
+                func.json_agg(
+                    aggregate_order_by(
+                        func.json_build_object(
+                            literal("position"), Speech.position,
+                            literal("seq"), Speech.sequence_in_team,
+                            literal("name"), Person.full_name,
+                            literal("score"), Speech.score,
+                        ),
+                        ORDER_POS_SPEECH.asc(),
+                        Speech.sequence_in_team.asc(),
+                    )
+                ).label("speeches_json"),
             )
+            .select_from(Speech)
             .join(EditionMember, EditionMember.id == Speech.edition_member_id)
             .join(Person, Person.id == EditionMember.person_id)
-            .where(Speech.debate_id.in_(select(debates_sq.c.id)))
-            .order_by(Speech.debate_id.asc(), ORDER_POS_SPEECH.asc(), Speech.sequence_in_team.asc())
-        ).all()
+            .group_by(Speech.debate_id)
+        ).subquery()
 
-        # Juízes por debate — idem: subquery em .in_
-        jgs = sess.execute(
+        # Subquery: juízes agregados por debate (chair + wings)
+        chair_role = cast(literal("chair"), JudgeRoleEnum)
+        wing_role = cast(literal("wing"), JudgeRoleEnum)
+        judge_string = func.concat(
+            func.trim(func.coalesce(Society.short_name, literal(""))),
+            literal(" — "),
+            Person.full_name,
+        )
+
+        judges_subq = (
             select(
-                DebateJudge.debate_id, DebateJudge.role,
-                Person.full_name, Society.short_name
+                DebateJudge.debate_id.label("debate_id"),
+                # um chair por debate (string_agg com filtro; se houver mais de 1, concatena)
+                func.string_agg(judge_string, literal(", ")).filter(DebateJudge.role == chair_role).label("chair"),
+                # wings como array ordenada por nome
+                func.array_agg(
+                    aggregate_order_by(judge_string, Person.full_name.asc())
+                ).filter(DebateJudge.role == wing_role).label("wings"),
             )
+            .select_from(DebateJudge)
             .join(EditionMember, EditionMember.id == DebateJudge.edition_member_id)
             .join(Person, Person.id == EditionMember.person_id)
             .outerjoin(Society, Society.id == Person.society_id)
-            .where(DebateJudge.debate_id.in_(select(debates_sq.c.id)))
-            .order_by(DebateJudge.debate_id.asc(), DebateJudge.role.asc(), Person.full_name.asc())
+            .group_by(DebateJudge.debate_id)
+        ).subquery()
+
+        # Subquery: totals por posição (somente quando há 2 falas com nota)
+        team_totals_subq = (
+            select(
+                DebatePosition.debate_id.label("debate_id"),
+                DebatePosition.position.label("position"),
+                func.sum(Speech.score).label("total"),
+            )
+            .select_from(Speech)
+            .join(Debate, Debate.id == Speech.debate_id)
+            .join(
+                DebatePosition,
+                (DebatePosition.debate_id == Speech.debate_id)
+                & (DebatePosition.position == Speech.position),
+            )
+            .where(Speech.score.is_not(None))
+            .group_by(DebatePosition.debate_id, DebatePosition.position)
+            .having(func.count(Speech.id) == 2)  # exige 2 falas com nota por posição
+        ).subquery()
+
+        # 2ª etapa: agrega em JSON por debate
+        totals_subq = (
+            select(
+                team_totals_subq.c.debate_id.label("debate_id"),
+                func.jsonb_object_agg(
+                    team_totals_subq.c.position,
+                    team_totals_subq.c.total,
+                ).label("totals_json"),
+            )
+            .group_by(team_totals_subq.c.debate_id)
+        ).subquery()
+
+        # 2) Debates prontos por rodada, com todas as agregações (1 query)
+        debates_rows = sess.execute(
+            select(
+                Debate.round_id,
+                Debate.id.label("debate_id"),
+                Debate.number_in_round.label("debate_number"),
+                positions_subq.c.positions_json,
+                speeches_subq.c.speeches_json,
+                judges_subq.c.chair,
+                judges_subq.c.wings,
+                totals_subq.c.totals_json,
+            )
+            .select_from(Debate)
+            .join(positions_subq, positions_subq.c.debate_id == Debate.id, isouter=True)
+            .join(speeches_subq, speeches_subq.c.debate_id == Debate.id, isouter=True)
+            .join(judges_subq, judges_subq.c.debate_id == Debate.id, isouter=True)
+            .join(totals_subq, totals_subq.c.debate_id == Debate.id, isouter=True)
+            .where(Debate.round_id.in_(round_ids))
+            .order_by(Debate.round_id.asc(), Debate.number_in_round.asc())
         ).all()
 
-        # Monta estrutura → rounds -> debates -> {positions, speeches, judges}
-        by_round = {r_id: {"id": r_id, "number": r_num, "date": r_date, "debates": {}}
-                    for (r_id, r_num, _rname, r_date, _dc, _st) in r_rows}
+        # 3) Montagem final em memória (linear, sem next()/buscas aninhadas)
+        by_round = {
+            r_id: {
+                "id": r_id,
+                "number": r_num,
+                "date": r_date,
+                "scores_published": bool(scores_pub),
+                "debates": [],
+            }
+            for (r_id, r_num, _rname, r_date, scores_pub, _dc, _st) in r_rows
+        }
 
-        # posições
-        for (deb_id, dnum, rid, posi, short) in pos:
-            rd = by_round[rid]["debates"].setdefault(deb_id, {
-                "id": deb_id, "number": dnum,
-                "positions": [], "speeches": {}, "judges": {"chair": None, "wings": []}
-            })
-            rd["positions"].append({"position": posi, "short_name": short})
+        for (rid, deb_id, dnum, positions_json, speeches_json, chair, wings, totals_json) in debates_rows:
+            # reconstruir estruturas simples p/ a view
+            positions = sorted(
+                [
+                    {"position": obj["position"], "short_name": obj["short_name"]}
+                    for obj in (positions_json or [])
+                ],
+                key=lambda x: {"OG": 1, "OO": 2, "CG": 3, "CO": 4}.get(x["position"], 99),
+            )
 
-        # speeches
-        for (deb_id, posi, seq, score, pname) in sp:
-            # acha round id do debate (map rápido)
-            # para eficiência, poderíamos mapear debates->round, mas o dataset é pequeno
-            target_round_id = None
-            for rid, rdata in by_round.items():
-                if deb_id in rdata["debates"]:
-                    target_round_id = rid
-                    break
-            if target_round_id is None:
-                continue
-            rddeb = by_round[target_round_id]["debates"][deb_id]
-            rddeb["speeches"].setdefault(posi, [])
-            rddeb["speeches"][posi].append({"name": pname, "score": int(score), "seq": int(seq)})
+            # speeches: agrupar por posição mantendo ordem seq
+            speeches_by_pos = {"OG": [], "OO": [], "CG": [], "CO": []}
+            for obj in (speeches_json or []):
+                speeches_by_pos.setdefault(obj["position"], []).append(
+                    {"name": obj["name"], "score": obj["score"], "seq": int(obj["seq"])}
+                )
+            for posk in list(speeches_by_pos.keys()):
+                speeches_by_pos[posk].sort(key=lambda it: it["seq"])
 
-        # judges
-        for (deb_id, role, pname, sshort) in jgs:
-            target_round_id = None
-            for rid, rdata in by_round.items():
-                if deb_id in rdata["debates"]:
-                    target_round_id = rid
-                    break
-            if target_round_id is None:
-                continue
-            rddeb = by_round[target_round_id]["debates"][deb_id]
-            if role == "chair":
-                rddeb["judges"]["chair"] = f"{(sshort or '').strip()} — {pname}"
+            # calcular totals/ranks (independente de published — a view decide exibir)
+            totals_map = {}
+            if totals_json:
+                # totals_json vem {position: total} apenas quando há 2 falas com nota
+                totals_map = {k: int(v) if v is not None else None for k, v in totals_json.items()}
             else:
-                rddeb["judges"]["wings"].append(f"{(sshort or '').strip()} — {pname}")
+                # manter None quando não há 2 falas válidas
+                totals_map = {
+                    posk: (sum((s["score"] or 0) for s in speeches_by_pos[posk]) if len(speeches_by_pos[posk]) == 2 else None)
+                    for posk in ["OG", "OO", "CG", "CO"]
+                }
 
-        # ordena e normaliza listas
-        # ordena e normaliza listas + calcula ranks
+            order_for_rank = sorted(
+                [(posk, totals_map.get(posk)) for posk in ["OG", "OO", "CG", "CO"]],
+                key=lambda t: (-t[1] if t[1] is not None else 10**9),
+            )
+            rank_by_pos = {posk: (idx + 1) for idx, (posk, _tot) in enumerate(order_for_rank)}
+
+            by_round[rid]["debates"].append({
+                "id": deb_id,
+                "number": dnum,
+                "positions": positions,
+                "speeches": speeches_by_pos,
+                "judges": {"chair": chair, "wings": wings or []},
+                "rank_by_pos": rank_by_pos,
+                "total_by_pos": totals_map,
+            })
+
+        # ordenar debates dentro de cada round
         result_rounds = []
         for rid, rdata in sorted(by_round.items(), key=lambda kv: kv[1]["number"]):
-            debates = [d for _, d in sorted(rdata["debates"].items(), key=lambda kv: kv[1]["number"])]
-            for d in debates:
-                # garantir lista de posições sempre OG, OO, CG, CO
-                d["positions"].sort(key=lambda x: {"OG": 1, "OO": 2, "CG": 3, "CO": 4}.get(x["position"], 99))
-                # ordenar speeches por seq
-                for posk in list(d["speeches"].keys()):
-                    d["speeches"][posk].sort(key=lambda it: it["seq"])
-
-                # ---- calcular total por posição e rank 1..4 (sem empates por regra de input) ----
-                totals = []
-                for posk in ["OG", "OO", "CG", "CO"]:
-                    sp = d["speeches"].get(posk, [])
-                    total = sum(s["score"] for s in sp) if len(sp) == 2 else None
-                    totals.append((posk, total))
-                # ordenar por total desc; se algum None, empurra para o fim (não deve ocorrer aqui)
-                ordered = sorted(totals, key=lambda t: (-t[1] if t[1] is not None else 10 ** 9))
-                rank_by_pos = {}
-                for idx, (posk, _tot) in enumerate(ordered, start=1):
-                    rank_by_pos[posk] = idx
-                d["rank_by_pos"] = rank_by_pos
-                d["total_by_pos"] = {posk: tot for (posk, tot) in totals}
-
+            rdata["debates"].sort(key=lambda d: d["number"])
             result_rounds.append({
-                "id": rid, "number": rdata["number"], "date": rdata["date"], "debates": debates
+                "id": rid,
+                "number": rdata["number"],
+                "date": rdata["date"],
+                "scores_published": rdata["scores_published"],
+                "debates": rdata["debates"],
             })
 
         return render_template("results_list.html", rounds=result_rounds)
 
     finally:
         sess.close()
-
 
 class LoginUser(UserMixin):
     """ Wrapper para integrar User do banco com Flask-Login """
@@ -744,37 +848,11 @@ def get_current_edition(sess):
         select(Edition).order_by(Edition.year.desc()).limit(1)
     ).scalar_one_or_none()
 
-
-def get_db():  # se já usa SessionLocal(), ignore
-    return SessionLocal()
-
-def current_staff(sessdb):
-    uid = session.get("user_id")
-    if not uid or session.get("auth_kind") != "staff":
-        return None
-    return sessdb.get(User, uid)
-
-def current_society(sessdb):
-    sid = session.get("soc_acc_id")
-    if not sid or session.get("auth_kind") != "society":
-        return None
-    return sessdb.get(SocietyAccount, sid)
-
-# Mantém seu roles_required existente. Adicione:
-
-
-def login_required_any(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if session.get("auth_kind") in ("staff", "society"):
-            return f(*args, **kwargs)
-        return redirect(url_for("login", next=request.path))
-    return wrapper
-
 # ---------- Rotas de login/logout unificadas ----------
 @app.get("/login")
 def login():
     return render_template("login_unified.html")
+
 
 @app.post("/login")
 def do_login():
@@ -890,7 +968,8 @@ def results_form():
                 for (d_id, n, spc) in debates
             ]
 
-        return render_template("results.html", rounds=rounds_with_status, debates=debates)
+        #return render_template("results.html", rounds=rounds_with_status, debates=debates)
+        return render_template("results.html", rounds=rounds_with_status, debates=[])
     finally:
         sess.close()
 
@@ -921,83 +1000,131 @@ def api_round_debates():
     finally:
         sess.close()
 
-
 @app.get("/api/debate_detail")
-@roles_required("director", "admin")
+@roles_required("director", "admin")  # mantenha protegido
 def api_debate_detail():
-    """Retorna posições (short_name) e listas elegíveis (debater/judge) para o form.
-       Juízes da(s) mesma(s) sociedade(s) do debate são excluídos.
-    """
-    debate_id = int(request.args.get("debate_id"))
+    debate_id = request.args.get("debate_id", type=int)
+    if not debate_id:
+        return jsonify({"error": "debate_id inválido"}), 400
+
     sess = SessionLocal()
     try:
-        # posições -> short_name e edition_society_id
-        order_case = case(
-            (DebatePosition.position == "OG", 1),
-            (DebatePosition.position == "OO", 2),
-            (DebatePosition.position == "CG", 3),
-            (DebatePosition.position == "CO", 4),
-            else_=99,
+        # ---------------------------------------------
+        # Query 1: meta + posições + lineup (1 ida só)
+        # ---------------------------------------------
+        # lineup por posição neste debate
+        lineup_subq = (
+            select(
+                Speech.position.label("position"),
+                func.array_agg(
+                    aggregate_order_by(Speech.edition_member_id, Speech.sequence_in_team.asc())
+                ).label("lineup"),
+            )
+            .select_from(Speech)
+            .where(Speech.debate_id == debate_id)
+            .group_by(Speech.position)
+            .subquery()
         )
 
         pos_rows = sess.execute(
             select(
+                Round.edition_id,                             # para queries seguintes
                 DebatePosition.position,
+                DebatePosition.edition_society_id,
+                EditionSociety.society_id,                    # para filtrar juízes de fora
                 Society.short_name,
-                EditionSociety.id
+                lineup_subq.c.lineup,                         # [edition_member_id, ...] ordenado
             )
+            .select_from(DebatePosition)
+            .join(Debate, Debate.id == DebatePosition.debate_id)
+            .join(Round, Round.id == Debate.round_id)
             .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
             .join(Society, Society.id == EditionSociety.society_id)
+            .join(lineup_subq, lineup_subq.c.position == DebatePosition.position, isouter=True)
             .where(DebatePosition.debate_id == debate_id)
-            .order_by(order_case.asc())
+            .order_by(ORDER_POS.asc())
         ).all()
-        team_shorts = { (short or "").strip() for (_pos, short, _esid) in pos_rows }
+        print(pos_rows)
+        if not pos_rows:
+            return jsonify({"error": "Debate não encontrado"}), 404
 
-        # edição do debate
-        edition_id = sess.execute(
-            select(Round.edition_id)
-            .join(Debate, Debate.round_id == Round.id)
-            .where(Debate.id == debate_id)
-        ).scalar_one()
+        # extrai edition_id / societies do debate e monta payload "positions"
+        edition_id = pos_rows[0][0]
+        positions = []
+        edsoc_ids = []
+        team_soc_ids = set()
 
-        # debaters (todos da edição)
+        for (_edition_id, position, edsoc_id, base_soc_id, short_name, lineup) in pos_rows:
+            positions.append({
+                "position": position,
+                "team_short": short_name,
+                "edition_society_id": edsoc_id,
+                "lineup": list(lineup or []),  # já ordenado por sequence_in_team
+            })
+            edsoc_ids.append(edsoc_id)
+            team_soc_ids.add(base_soc_id)
+
+        # ---------------------------------------------
+        # Query 2: debatedores elegíveis (4 sociedades)
+        # ---------------------------------------------
+        EM = aliased(EditionMember)
         deb_rows = sess.execute(
-            select(EditionMember.id, Person.full_name, Society.short_name)
-            .join(Person, Person.id == EditionMember.person_id)
-            .join(Edition, Edition.id == EditionMember.edition_id)
-            .outerjoin(Society, Society.id == Person.society_id)
-            .where(EditionMember.edition_id == edition_id, EditionMember.kind == "debater")
+            select(
+                EM.id,
+                Person.full_name,
+                Society.short_name,
+            )
+            .select_from(EM)
+            .join(Person, Person.id == EM.person_id)
+            .join(Society, Society.id == Person.society_id)
+            .where(
+                EM.edition_id == edition_id,
+                EM.kind == cast(literal("debater"), MemberKindEnum),  # <-- cast para o enum
+                Person.society_id.in_(team_soc_ids),
+            )
             .order_by(Society.short_name.asc(), Person.full_name.asc())
         ).all()
 
-        # judges (exclui quem tem society no debate)
+        debaters = [
+            {"edition_member_id": mid, "name": name, "soc": short}
+            for (mid, name, short) in deb_rows
+        ]
+
+        # ---------------------------------------------
+        # Query 3: juízes elegíveis (fora das 4 sociedades)
+        # ---------------------------------------------
+        J = aliased(EditionMember)
         judge_rows = sess.execute(
-            select(EditionMember.id, Person.full_name, Society.short_name)
-            .join(Person, Person.id == EditionMember.person_id)
-            .join(Edition, Edition.id == EditionMember.edition_id)
-            .outerjoin(Society, Society.id == Person.society_id)
-            .where(EditionMember.edition_id == edition_id, EditionMember.kind == "judge")
+            select(
+                J.id,
+                Person.full_name,
+                Society.short_name,
+            )
+            .select_from(J)
+            .join(Person, Person.id == J.person_id)
+            .join(Society, Society.id == Person.society_id)   # mantém a mesma semântica do seu código
+            .where(
+                J.edition_id == edition_id,
+                J.kind == cast(literal("judge"), MemberKindEnum),     # <-- cast para o enum
+                ~Person.society_id.in_(team_soc_ids),          # exclui as 4 sociedades
+            )
             .order_by(Society.short_name.asc(), Person.full_name.asc())
         ).all()
-        judge_rows = [r for r in judge_rows if (r[2] or "").strip() not in team_shorts]
 
-        data = {
-            "positions": [
-                {"position": pos, "team_short": (short or ""), "edition_society_id": esid}
-                for (pos, short, esid) in pos_rows
-            ],
-            "debaters": [
-                {"edition_member_id": mid, "name": name, "soc": (short or "")}
-                for (mid, name, short) in deb_rows
-            ],
-            "judges": [
-                {"edition_member_id": mid, "name": name, "soc": (short or "")}
-                for (mid, name, short) in judge_rows
-            ],
-        }
-        return jsonify(data=data)
+        judges = [
+            {"edition_member_id": mid, "name": name, "soc": short}
+            for (mid, name, short) in judge_rows
+        ]
+
+        return jsonify({"data": {
+            "positions": positions,
+            "debaters": debaters,
+            "judges": judges
+        }})
+
     finally:
         sess.close()
+
 
 @app.post("/api/results")
 @roles_required("director", "admin")
@@ -1156,17 +1283,15 @@ def api_save_results():
 
 
 @app.get("/api/standings")
-def api_standings():
-    """
-    Classificação da edição vigente (ou ?edition=YYYY).
-
-    Ordenação: pontos desc, speaker_points desc, firsts desc, seconds desc.
-    Payload (só short_name):
-      [{ society_id, short_name, points, speaker_points, firsts, seconds, debates }]
-    """
+def api_standings(debug=False):
     sess = SessionLocal()
     try:
-        edition_param = request.args.get("edition", "current")
+        # --- edição alvo ---
+        if debug:
+            edition_param = 2025
+        else:
+            edition_param = request.args.get("edition", "current")
+
         if edition_param == "current":
             edition = get_current_edition(sess)
         else:
@@ -1177,106 +1302,162 @@ def api_standings():
         if not edition:
             return jsonify(data=[])
 
-        # Sociedades inscritas na edição
-        esocs = sess.execute(
-            select(EditionSociety.id, Society.id, Society.short_name)
-            .join(Society, Society.id == EditionSociety.society_id)
-            .where(EditionSociety.edition_id == edition.id)
-        ).all()
-
-        # agregador
-        agg = {}
-        for es_id, s_id, s_short in esocs:
-            short = (s_short or "").strip()
-            if short == "Independente":
-                continue
-            agg[es_id] = {
-                "edsoc_id": es_id,
-                "society_id": s_id,
-                "short_name": short,
-                "points": 0,
-                "speaker_points": 0,
-                "firsts": 0,
-                "seconds": 0,
-                "debates": 0,
-            }
-
-        # Debates da edição
-        debates = sess.execute(
-            select(Debate.id, Debate.number_in_round)
+        # ------------------------------------------------------------
+        # 1) Totais por (debate, posição/equipe) com contagem de falas
+        #    (Speech -> Debate -> Round) + DebatePosition para mapear ES
+        # ------------------------------------------------------------
+        team_scores_per_team_sq = (
+            select(
+                Speech.debate_id.label("debate_id"),
+                Speech.position.label("position"),
+                DebatePosition.edition_society_id.label("es_id"),
+                func.sum(Speech.score).label("team_total"),
+                func.count(Speech.id).label("speech_count"),
+                Round.scores_published.label("scores_published"),
+            )
+            .join(Debate, Debate.id == Speech.debate_id)
             .join(Round, Round.id == Debate.round_id)
+            .join(
+                DebatePosition,
+                and_(
+                    DebatePosition.debate_id == Speech.debate_id,
+                    DebatePosition.position == Speech.position,
+                ),
+            )
             .where(
                 Round.edition_id == edition.id,
-                Round.silent.is_(False)
+                Round.silent.is_(False),
+                Speech.score.is_not(None),
             )
-        ).all()
-        debate_ids = [debate_id for debate_id, _ in debates]
-        if not debate_ids:
-            data = sorted(
-                agg.values(),
-                key=lambda x: (-x["points"], -x["speaker_points"], -x["firsts"], -x["seconds"], x["short_name"])
+            .group_by(
+                Speech.debate_id,
+                Speech.position,
+                DebatePosition.edition_society_id,
+                Round.scores_published,
             )
-            return jsonify(data=data)
-
-        # Posições por debate
-        pos_rows = sess.execute(
-            select(DebatePosition.debate_id, DebatePosition.position, DebatePosition.edition_society_id)
-            .where(DebatePosition.debate_id.in_(debate_ids))
-        ).all()
-        from collections import defaultdict
-        debate_positions = defaultdict(dict)
-        for d_id, pos, es_id in pos_rows:
-            debate_positions[d_id][pos] = es_id
-
-        # Speeches
-        speech_rows = sess.execute(
-            select(Speech.debate_id, Speech.position, Speech.sequence_in_team, Speech.score)
-            .where(Speech.debate_id.in_(debate_ids))
-        ).all()
-        debate_team_scores = defaultdict(lambda: {"OG": [], "OO": [], "CG": [], "CO": []})
-        for d_id, pos, _seq, score in speech_rows:
-            if score is not None:
-                debate_team_scores[d_id][pos].append(int(score))
-
-        # Consolidação por debate completo (8 notas)
-        for d_id in debate_ids:
-            teams = debate_positions.get(d_id, {})
-            if set(teams.keys()) != {"OG", "OO", "CG", "CO"}:
-                continue
-            sums = {}
-            complete = True
-            for pos, es_id in teams.items():
-                scores = debate_team_scores[d_id][pos]
-                if len(scores) != 2:
-                    complete = False
-                    break
-                sums[es_id] = sum(scores)
-            if not complete:
-                continue
-
-            # speaker points + contagem de debates
-            for es_id, total in sums.items():
-                agg[es_id]["speaker_points"] += total
-                agg[es_id]["debates"] += 1
-
-            # ranking no debate: 3/2/1/0
-            ordered = sorted(sums.items(), key=lambda kv: kv[1], reverse=True)
-            for rank, (es_id, _tot) in enumerate(ordered):
-                if rank == 0:
-                    agg[es_id]["points"] += 3
-                    agg[es_id]["firsts"] += 1
-                elif rank == 1:
-                    agg[es_id]["points"] += 2
-                    agg[es_id]["seconds"] += 1
-                elif rank == 2:
-                    agg[es_id]["points"] += 1
-                # rank 3 → +0
-
-        data = sorted(
-            agg.values(),
-            key=lambda x: (-x["points"], -x["speaker_points"], -x["firsts"], -x["seconds"], x["short_name"])
+            .subquery()
         )
-        return jsonify(data=data)
+
+        # ------------------------------------------------------------
+        # 2) Debates completos = 4 linhas com speech_count=2 (OG/OO/CG/CO)
+        # ------------------------------------------------------------
+        complete_debates_sq = (
+            select(team_scores_per_team_sq.c.debate_id)
+            .where(team_scores_per_team_sq.c.speech_count == 2)
+            .group_by(team_scores_per_team_sq.c.debate_id)
+            .having(func.count() == 4)
+            .subquery()
+        )
+
+        # ------------------------------------------------------------
+        # 3) Subconsulta com rank() por debate (apenas debates completos)
+        #    IMPORTANTE: a janela fica AQUI (subquery), não no nível agregado
+        # ------------------------------------------------------------
+        ranked_sq = (
+            select(
+                team_scores_per_team_sq.c.debate_id,
+                team_scores_per_team_sq.c.es_id,
+                team_scores_per_team_sq.c.team_total,
+                team_scores_per_team_sq.c.scores_published,
+                func.rank().over(
+                    partition_by=team_scores_per_team_sq.c.debate_id,
+                    order_by=team_scores_per_team_sq.c.team_total.desc(),
+                ).label("rnk"),
+            )
+            .join(
+                complete_debates_sq,
+                complete_debates_sq.c.debate_id == team_scores_per_team_sq.c.debate_id,
+            )
+            .where(team_scores_per_team_sq.c.speech_count == 2)
+            .subquery()
+        )
+
+        # mapeamento 3-2-1-0 + contagens
+        points_expr = case(
+            (ranked_sq.c.rnk == 1, literal(3)),
+            (ranked_sq.c.rnk == 2, literal(2)),
+            (ranked_sq.c.rnk == 3, literal(1)),
+            else_=literal(0),
+        )
+        firsts_expr = case((ranked_sq.c.rnk == 1, literal(1)), else_=literal(0))
+        seconds_expr = case((ranked_sq.c.rnk == 2, literal(1)), else_=literal(0))
+        sp_expr = case(
+            (ranked_sq.c.scores_published.is_(True), ranked_sq.c.team_total),
+            else_=literal(0),
+        )
+
+        # ------------------------------------------------------------
+        # 4) Agregado final por equipe (EditionSociety)
+        #    (agora SIM podemos somar, pois o rank ficou na subquery)
+        # ------------------------------------------------------------
+        standings_sq = (
+            select(
+                ranked_sq.c.es_id.label("es_id"),
+                func.sum(points_expr).label("points"),
+                func.sum(sp_expr).label("speaker_points"),
+                func.sum(firsts_expr).label("firsts"),
+                func.sum(seconds_expr).label("seconds"),
+                func.count().label("debates"),
+            )
+            .group_by(ranked_sq.c.es_id)
+            .subquery()
+        )
+
+        # ------------------------------------------------------------
+        # 5) Base (todas as sociedades inscritas != "Independente")
+        #    + LEFT JOIN com o agregado e ordenação final no banco
+        # ------------------------------------------------------------
+        base_q = (
+            select(
+                EditionSociety.id.label("es_id"),
+                Society.id.label("society_id"),
+                Society.short_name.label("short_name"),
+            )
+            .join(Society, Society.id == EditionSociety.society_id)
+            .where(
+                EditionSociety.edition_id == edition.id,
+                func.trim(func.coalesce(Society.short_name, "")) != "Independente",
+            )
+            .subquery()
+        )
+
+        final_q = (
+            select(
+                base_q.c.es_id.label("edsoc_id"),  # <— novo
+                base_q.c.society_id,
+                base_q.c.short_name,
+                func.coalesce(standings_sq.c.points, literal(0)).label("points"),
+                func.coalesce(standings_sq.c.speaker_points, literal(0)).label("speaker_points"),
+                func.coalesce(standings_sq.c.firsts, literal(0)).label("firsts"),
+                func.coalesce(standings_sq.c.seconds, literal(0)).label("seconds"),
+                func.coalesce(standings_sq.c.debates, literal(0)).label("debates"),
+            )
+            .join(standings_sq, standings_sq.c.es_id == base_q.c.es_id, isouter=True)
+            .order_by(
+                func.coalesce(standings_sq.c.points, literal(0)).desc(),
+                func.coalesce(standings_sq.c.speaker_points, literal(0)).desc(),
+                func.coalesce(standings_sq.c.firsts, literal(0)).desc(),
+                func.coalesce(standings_sq.c.seconds, literal(0)).desc(),
+                base_q.c.short_name.asc(),
+            )
+        )
+
+        rows = sess.execute(final_q).all()
+
+        data = [
+            dict(
+                edsoc_id=es_id,  # <— novo campo no payload
+                society_id=sid,
+                short_name=(sn or "").strip(),
+                points=int(p),
+                speaker_points=int(sp),
+                firsts=int(f),
+                seconds=int(s2),
+                debates=int(db),
+            )
+            for es_id, sid, sn, p, sp, f, s2, db in rows
+        ]
+        return jsonify(data=data) if not debug else data
     finally:
         sess.close()
 
@@ -1288,6 +1469,7 @@ def api_next_pairings():
     """
     sess = SessionLocal()
     try:
+        # --- edição alvo ---
         edition_param = request.args.get("edition", "current")
         if edition_param == "current":
             edition = get_current_edition(sess)
@@ -1299,73 +1481,142 @@ def api_next_pairings():
         if not edition:
             return jsonify(data=[])
 
-        rounds = sess.execute(
+        # ------------------------------------------------------------
+        # 1) Encontrar a primeira rodada SEM resultados
+        #    Critério: NÃO existe Speech com score != NULL em debates da rodada
+        # ------------------------------------------------------------
+        any_scored_subq = (
+            select(literal(1))   # <---- aqui é literal(1), não func.literal
+            .select_from(Debate)
+            .join(Speech, Speech.debate_id == Debate.id)
+            .where(
+                Debate.round_id == Round.id,   # correlacionada com Round externo
+                Speech.score.is_not(None),
+            )
+            .limit(1)
+        )
+
+        next_round_row = sess.execute(
             select(Round.id, Round.number)
-            .where(Round.edition_id == edition.id)
+            .where(
+                Round.edition_id == edition.id,
+                ~exists(any_scored_subq)       # NOT EXISTS
+            )
             .order_by(Round.number.asc())
-        ).all()
-        if not rounds:
+            .limit(1)
+        ).first()
+
+        if not next_round_row:
             return jsonify(data=[])
 
-        # acha a primeira rodada sem notas
-        next_round_id = None
-        next_round_number = None
-        for r_id, r_num in rounds:
-            debate_ids = sess.execute(
-                select(Debate.id).where(Debate.round_id == r_id)
-            ).scalars().all()
-            if not debate_ids:
-                next_round_id, next_round_number = r_id, r_num
-                break
-            any_score = sess.execute(
-                select(func.count(Speech.id))
-                .where(Speech.debate_id.in_(debate_ids), Speech.score.isnot(None))
-            ).scalar_one()
-            if any_score == 0:
-                next_round_id, next_round_number = r_id, r_num
-                break
+        next_round_id, next_round_number = next_round_row
 
-        if not next_round_id:
-            return jsonify(data=[])
-
-        debates = sess.execute(
-            select(Debate.id, Debate.number_in_round)
+        # ------------------------------------------------------------
+        # 2) Buscar TODOS os pareamentos da rodada encontrada
+        # ------------------------------------------------------------
+        rows = sess.execute(
+            select(
+                Debate.id.label("debate_id"),
+                Debate.number_in_round.label("debate_number"),
+                DebatePosition.position,
+                Society.short_name,
+            )
+            .join(DebatePosition, DebatePosition.debate_id == Debate.id)
+            .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
+            .join(Society, Society.id == EditionSociety.society_id)
             .where(Debate.round_id == next_round_id)
             .order_by(Debate.number_in_round.asc())
         ).all()
-        debate_ids = [debate_id for debate_id, _ in debates]
-
-        # posições com short_name
-        pos_rows = sess.execute(
-            select(
-                DebatePosition.debate_id,
-                DebatePosition.position,
-                Society.short_name
-            )
-            .join(EditionSociety, EditionSociety.id == DebatePosition.edition_society_id)
-            .join(Society, Society.id == EditionSociety.society_id)
-            .where(DebatePosition.debate_id.in_(debate_ids))
-        ).all()
 
         from collections import defaultdict
-        by_debate = defaultdict(dict)  # debate_id -> { OG/OO/CG/CO: short_name }
-        for d_id, pos, short in pos_rows:
+        by_debate = defaultdict(lambda: {"OG": "", "OO": "", "CG": "", "CO": ""})
+        debate_numbers = {}
+        for d_id, d_num, pos, short in rows:
+            debate_numbers[d_id] = d_num
             by_debate[d_id][pos] = (short or f"D{d_id}")
 
-        data = []
-        for d_id, d_num in debates:
-            positions = by_debate.get(d_id, {})
-            data.append({
+        debates_sorted = sorted(debate_numbers.items(), key=lambda kv: kv[1])
+        data = [
+            {
                 "round_number": next_round_number,
                 "debate_number": d_num,
-                "positions": {
-                    "OG": positions.get("OG", ""),
-                    "OO": positions.get("OO", ""),
-                    "CG": positions.get("CG", ""),
-                    "CO": positions.get("CO", ""),
-                }
-            })
+                "positions": by_debate[d_id],
+            }
+            for d_id, d_num in debates_sorted
+        ]
+
         return jsonify(data=data)
+    finally:
+        sess.close()
+
+@app.get("/admin")
+@roles_required("director", "admin")
+def admin_panel():
+    sess = SessionLocal()
+    try:
+        edition = get_current_edition(sess)
+        if not edition:
+            return render_template("admin_panel.html", rounds=[])
+        rows = sess.execute(
+            select(Round.id, Round.number, Round.name, Round.scheduled_date,
+                   Round.scores_published, Round.silent)
+            .where(Round.edition_id == edition.id)
+            .order_by(Round.number.asc())
+        ).all()
+        rounds = [
+            {
+                "id": r_id,
+                "number": r_num,
+                "name": r_name,
+                "date": r_date,
+                "scores_published": bool(scores),
+                "silent": bool(sil)
+            }
+            for (r_id, r_num, r_name, r_date, scores, sil) in rows
+        ]
+        return render_template("admin_panel.html", rounds=rounds)
+    finally:
+        sess.close()
+
+
+@app.post("/api/rounds/<int:round_id>/settings")
+@roles_required("director", "admin")
+def api_update_round_settings(round_id: int):
+    """
+    Body JSON (qualquer um dos dois campos; ambos opcionais):
+    { "scores_published": true|false, "silent": true|false }
+    """
+    payload = request.get_json(silent=True) or {}
+    sess = SessionLocal()
+    try:
+        rnd = sess.get(Round, round_id)
+        if not rnd:
+            return jsonify({"error": "Rodada não encontrada"}), 404
+
+        changed = False
+        if "scores_published" in payload:
+            val = bool(payload["scores_published"])
+            if rnd.scores_published != val:
+                rnd.scores_published = val
+                changed = True
+
+        if "silent" in payload:
+            val = bool(payload["silent"])
+            if rnd.silent != val:
+                rnd.silent = val
+                changed = True
+
+        if changed:
+            sess.commit()
+
+        return jsonify({
+            "ok": True,
+            "data": {
+                "id": rnd.id,
+                "scores_published": rnd.scores_published,
+                "silent": rnd.silent
+            }
+        })
     finally:
         sess.close()
 

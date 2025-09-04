@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Painel de Administração • Taça das Sociedades</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-sky-50 to-white text-slate-800">
+  <header class="sticky top-0 z-20 backdrop-blur bg-white/70 border-b border-slate-200">
+    <div class="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <img src="{{ url_for('static', filename='taca.png') }}" class="h-10 w-10 object-contain" alt="Taça">
+        <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-sky-800">Painel de Administração</h1>
+      </div>
+      <div class="flex items-center gap-2">
+        <a href="{{ url_for('home') }}"
+           class="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-slate-700 hover:bg-slate-50">
+          ← Voltar à página principal
+        </a>
+        <img src="{{ url_for('static', filename='condeb.png') }}" class="h-8 object-contain" alt="CONDEB">
+      </div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+    <div id="alert" class="hidden rounded-xl border border-amber-300 bg-amber-50 text-amber-900 px-4 py-3"></div>
+
+    <section class="bg-white rounded-2xl shadow-sm border border-slate-200">
+      <div class="px-5 py-4 border-b border-slate-100">
+        <h2 class="text-xl font-semibold text-sky-900">Rodadas</h2>
+      </div>
+
+      <div class="overflow-x-auto p-5">
+        <table class="min-w-full text-sm">
+          <thead class="bg-sky-50 text-sky-900">
+            <tr>
+              <th class="px-4 py-3 text-left">#</th>
+              <th class="px-4 py-3 text-left">Data</th>
+              <th class="px-4 py-3 text-center">Speaks divulgados</th>
+              <th class="px-4 py-3 text-center">Rodada Fechada</th>
+            </tr>
+          </thead>
+          <tbody id="tbody-rounds">
+            {% for r in rounds %}
+              <tr class="border-t border-slate-200">
+                <td class="px-4 py-3 font-medium text-slate-800">#{{ r.number }}</td>
+                <td class="px-4 py-3">{{ r.date or '—' }}</td>
+                <td class="px-4 py-3 text-center">
+                  <label class="inline-flex items-center gap-2">
+                    <input type="checkbox"
+                           class="toggle-scores h-4 w-4 accent-sky-600"
+                           data-round-id="{{ r.id }}"
+                           {% if r.scores_published %}checked{% endif %} />
+                    <span class="text-xs text-slate-600">publicado</span>
+                  </label>
+                </td>
+                <td class="px-4 py-3 text-center">
+                  <label class="inline-flex items-center gap-2">
+                    <input type="checkbox"
+                           class="toggle-silent h-4 w-4 accent-sky-600"
+                           data-round-id="{{ r.id }}"
+                           {% if r.silent %}checked{% endif %} />
+                    <span class="text-xs text-slate-600">silent</span>
+                  </label>
+                </td>
+              </tr>
+            {% endfor %}
+            {% if not rounds or rounds|length == 0 %}
+              <tr><td colspan="5" class="px-4 py-6 text-center text-slate-600">Nenhuma rodada encontrada.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const alertEl = document.getElementById('alert');
+    function showAlert(msg) {
+      alertEl.textContent = msg;
+      alertEl.classList.remove('hidden');
+    }
+    function hideAlert() {
+      alertEl.classList.add('hidden');
+      alertEl.textContent = '';
+    }
+
+    async function patchRound(roundId, patch) {
+      const res = await fetch(`/api/rounds/${roundId}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json.error) {
+        throw new Error(json.error || 'Falha ao atualizar.');
+      }
+      return json.data || {};
+    }
+
+    document.querySelectorAll('.toggle-scores').forEach(chk => {
+      chk.addEventListener('change', async (e) => {
+        hideAlert();
+        const id = e.target.dataset.roundId;
+        const val = !!e.target.checked;
+        try {
+          await patchRound(id, { scores_published: val });
+        } catch (err) {
+          showAlert(err.message);
+          e.target.checked = !val; // desfaz
+        }
+      });
+    });
+
+    document.querySelectorAll('.toggle-silent').forEach(chk => {
+      chk.addEventListener('change', async (e) => {
+        hideAlert();
+        const id = e.target.dataset.roundId;
+        const val = !!e.target.checked;
+        try {
+          await patchRound(id, { silent: val });
+        } catch (err) {
+          showAlert(err.message);
+          e.target.checked = !val; // desfaz
+        }
+      });
+    });
+  </script>
+</body>
+</html>
