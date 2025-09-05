@@ -187,6 +187,10 @@ def _eligible_debaters_for_next_round(sess, edition_id: int, base_society_id: in
     return [{"id": mid, "name": name} for (mid, name, used) in rows if int(used or 0) < 4]
 
 
+@app.get("/health-check")
+def page_escalacao():
+    return "ok"
+
 # ---------- Página: Escalação (sociedade) ----------
 @app.get("/soc/escalacao")
 @society_required
