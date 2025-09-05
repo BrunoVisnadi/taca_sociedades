@@ -188,7 +188,7 @@ def _eligible_debaters_for_next_round(sess, edition_id: int, base_society_id: in
 
 
 @app.get("/health-check")
-def page_escalacao():
+def health_check():
     return "ok"
 
 # ---------- Página: Escalação (sociedade) ----------
