@@ -479,16 +479,107 @@ def view_society_history(edsoc_id: int):
 @app.post("/soc/escalacao")
 @society_required
 def post_escalacao():
-    # ... (validações iguais às anteriores)
+    """Salva/atualiza escalação (2 debatedores) para o debate/posição da sociedade.
+       Regras:
+       - debate/posição devem pertencer à sociedade logada;
+       - debatedores devem ser EditionMember(kind='debater') da MESMA sociedade/edição;
+       - não pode escolher a mesma pessoa pros dois slots;
+       - se já houver score (resultado lançado) naquele debate/posição, BLOQUEIA edição.
+    """
+    data = request.form or request.json or {}
+    debate_id = int(data.get("debate_id", 0))
+    s1_id = int(data.get("s1_id", 0))
+    s2_id = int(data.get("s2_id", 0))
+
+    if not debate_id or not s1_id or not s2_id:
+        flash("Preencha os dois debatedores.", "error")
+        return redirect(request.referrer or url_for("page_escalacao"))
+
+    if s1_id == s2_id:
+        flash("Os dois debatedores devem ser pessoas diferentes.", "error")
+        return redirect(request.referrer or url_for("page_escalacao"))
+
     sess = SessionLocal()
     try:
         edsoc, edition_id, base_soc_id = _get_soc_context(sess)
-        # ... (checks iguais)
-        # upsert dos dois slots (score=None) iguais
+        if not edsoc:
+            return redirect(url_for("login"))
 
+        # Verifica que o debate pertence à mesma edição e contém a sociedade (descobre a posição)
+        pos_row = sess.execute(
+            select(DebatePosition.position, Debate.round_id)
+            .join(Debate, Debate.id == DebatePosition.debate_id)
+            .where(
+                DebatePosition.debate_id == debate_id,
+                DebatePosition.edition_society_id == edsoc.id
+            )
+        ).first()
+        if not pos_row:
+            flash("Você não possui permissão para este debate.", "error")
+            return redirect(request.referrer or url_for("page_escalacao"))
+        position, round_id = pos_row
+
+        # Debatedores válidos? (da mesma sociedade base e edição, e kind='debater')
+        def _valid_deb(member_id: int) -> bool:
+            row = sess.execute(
+                select(EditionMember.id)
+                .join(Person, Person.id == EditionMember.person_id)
+                .where(
+                    EditionMember.id == member_id,
+                    EditionMember.edition_id == edition_id,
+                    EditionMember.kind == "debater",
+                    Person.society_id == base_soc_id
+                )
+            ).scalar_one_or_none()
+            return bool(row)
+
+        if not (_valid_deb(s1_id) and _valid_deb(s2_id)):
+            flash("Debatedor inválido para esta sociedade/edição.", "error")
+            return redirect(request.referrer or url_for("page_escalacao"))
+
+        # Verifica se já há resultado (score != NULL) -> bloqueia
+        scored = sess.execute(
+            select(func.count(Speech.id))
+            .where(
+                Speech.debate_id == debate_id,
+                Speech.position == position,
+                Speech.score.isnot(None)
+            )
+        ).scalar_one()
+        if scored and scored > 0:
+            flash("Edição bloqueada: este debate já possui resultado lançado.", "error")
+            return redirect(request.referrer or url_for("page_escalacao"))
+
+        # Upsert da escalação (cria/atualiza os dois slots com score=NULL)
+        slots = {
+            1: s1_id,
+            2: s2_id,
+        }
+        existing = sess.execute(
+            select(Speech.id, Speech.sequence_in_team)
+            .where(Speech.debate_id == debate_id, Speech.position == position)
+        ).all()
+        existing_by_seq = {seq: sid for (sid, seq) in existing}
+
+        for seq, member_id in slots.items():
+            if seq in existing_by_seq:
+                # update
+                sp = sess.get(Speech, existing_by_seq[seq])
+                sp.edition_member_id = member_id
+                sp.score = None
+            else:
+                # insert
+                sess.add(Speech(
+                    debate_id=debate_id,
+                    position=position,
+                    sequence_in_team=seq,
+                    edition_member_id=member_id,
+                    score=None
+                ))
         sess.commit()
         flash("Escalação salva com sucesso.", "success")
-        return redirect(url_for("home"))   # <— volta pra principal
+        # redireciona mantendo a rodada atual
+        return redirect(url_for("home"))
     finally:
         sess.close()
 
