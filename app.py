@@ -519,37 +519,6 @@ def post_escalacao():
             return redirect(request.referrer or url_for("page_escalacao"))
         position, round_id = pos_row
 
-        # Debatedores válidos? (da mesma sociedade base e edição, e kind='debater')
-        def _valid_deb(member_id: int) -> bool:
-            row = sess.execute(
-                select(EditionMember.id)
-                .join(Person, Person.id == EditionMember.person_id)
-                .where(
-                    EditionMember.id == member_id,
-                    EditionMember.edition_id == edition_id,
-                    EditionMember.kind == "debater",
-                    Person.society_id == base_soc_id
-                )
-            ).scalar_one_or_none()
-            return bool(row)
-
-        if not (_valid_deb(s1_id) and _valid_deb(s2_id)):
-            flash("Debatedor inválido para esta sociedade/edição.", "error")
-            return redirect(request.referrer or url_for("page_escalacao"))
-
-        # Verifica se já há resultado (score != NULL) -> bloqueia
-        scored = sess.execute(
-            select(func.count(Speech.id))
-            .where(
-                Speech.debate_id == debate_id,
-                Speech.position == position,
-                Speech.score.isnot(None)
-            )
-        ).scalar_one()
-        if scored and scored > 0:
-            flash("Edição bloqueada: este debate já possui resultado lançado.", "error")
-            return redirect(request.referrer or url_for("page_escalacao"))
-
         # Upsert da escalação (cria/atualiza os dois slots com score=NULL)
         slots = {
             1: s1_id,
