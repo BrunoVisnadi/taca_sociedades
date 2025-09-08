@@ -22,8 +22,6 @@ def user():
         sess.close()
 
 
-from werkzeug.security import generate_password_hash
-
 def create_society_account(sess, edition_society_id: int, email: str, raw_password: str):
     email = email.strip().lower()
     acc = sess.execute(
@@ -40,5 +38,12 @@ def create_society_account(sess, edition_society_id: int, email: str, raw_passwo
     sess.commit()
 
 if __name__ == '__main__':
-
-    create_society_account(SessionLocal(), 2, "SDUFRJ", "terceiro3olugar3")
+    pass
+    # d = {1: "SdDUFSC", 3: 'SDUERJ', 4: 'SdDUFC', 5: 'SDS', 6: 'Senatus', 7: 'SdDUNIFOR', 8: "Agora", 9: "GDO", 10: 'SDP'}
+    # for i, n in d.items():
+    #
+    #     s = (generate_password_hash(n))
+    #     senha = s[-16:]
+    #     print(i, n, senha)
+    #
+    #     create_society_account(SessionLocal(), i, n, senha)

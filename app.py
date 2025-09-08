@@ -5,7 +5,7 @@ from functools import wraps
 from flask import Flask, jsonify, render_template, request, redirect, url_for, flash, session, abort
 from flask_login import LoginManager, UserMixin
 from werkzeug.security import check_password_hash
-from sqlalchemy import cast, literal, case, distinct, desc, exists, select, func, case, and_
+from sqlalchemy import cast, literal, distinct, desc, exists, select, func, case, and_
 from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from db import SessionLocal
@@ -27,8 +27,8 @@ app = Flask(
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    # Em produção:
-    SESSION_COOKIE_SECURE=True  # se seu domínio usa HTTPS (Render usa)
+    # prod:
+    SESSION_COOKIE_SECURE=True
 )
 app.secret_key = os.environ.get("SECRET_KEY", "dev-unsafe")
 
@@ -43,6 +43,14 @@ ORDER_POS = case(
     (DebatePosition.position == "CO", 4),
     else_=99,
 )
+ORDER_POS_SPEECH = case(
+    (Speech.position == "OG", 1),
+    (Speech.position == "OO", 2),
+    (Speech.position == "CG", 3),
+    (Speech.position == "CO", 4),
+    else_=99,
+)
+
 
 def society_required(f):
     @wraps(f)
@@ -562,6 +570,9 @@ def view_pairings():
             return render_template("pairings.html", rounds=[])
 
         # Rodadas sem nenhum resultado (nenhuma Speech em nenhum debate da rodada)
+        scores_filled = func.sum(
+            case((Speech.score.isnot(None), 1), else_=0)
+        )
         rows = sess.execute(
             select(
                 Round.id, Round.number, Round.name, Round.scheduled_date,
@@ -572,7 +583,8 @@ def view_pairings():
             .join(Speech, Speech.debate_id == Debate.id, isouter=True)
             .where(Round.edition_id == edition.id)
             .group_by(Round.id)
-            .having(func.count(Speech.id) == 0)  # nenhuma Speech na rodada
+            .having(scores_filled == 0)
+            .having(func.count(distinct(Debate.id)) > 0)
             .order_by(Round.number.asc())
         ).all()
         round_ids = [r_id for (r_id, *_rest) in rows]
@@ -656,22 +668,6 @@ def view_results_list():
         round_ids = [r_id for (r_id, *_rest) in r_rows]
         if not round_ids:
             return render_template("results_list.html", rounds=[])
-
-        # Preparar CASE p/ ordenar posições
-        ORDER_POS = case(
-            (DebatePosition.position == "OG", 1),
-            (DebatePosition.position == "OO", 2),
-            (DebatePosition.position == "CG", 3),
-            (DebatePosition.position == "CO", 4),
-            else_=99,
-        )
-        ORDER_POS_SPEECH = case(
-            (Speech.position == "OG", 1),
-            (Speech.position == "OO", 2),
-            (Speech.position == "CG", 3),
-            (Speech.position == "CO", 4),
-            else_=99,
-        )
 
         # Subquery: posições (sociedade por posição) agregadas por debate
         positions_subq = (
