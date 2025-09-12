@@ -646,6 +646,9 @@ def view_results_list():
             return render_template("results_list.html", rounds=[])
 
         # 1) Rodadas completas, não-silent (1 query)
+        sp_scored = func.count(Speech.id).filter(Speech.score.is_not(None)).label("sp_scored")
+        deb_cnt = func.count(distinct(Debate.id)).label("deb_count")
+
         r_rows = sess.execute(
             select(
                 Round.id,
@@ -653,15 +656,15 @@ def view_results_list():
                 Round.name,
                 Round.scheduled_date,
                 Round.scores_published,
-                func.count(distinct(Debate.id)).label("deb_count"),
-                func.count(Speech.id).label("sp_total"),
+                deb_cnt,
+                sp_scored,  # <- speeches com score != NULL
             )
             .join(Debate, Debate.round_id == Round.id, isouter=True)
             .join(Speech, Speech.debate_id == Debate.id, isouter=True)
             .where(Round.edition_id == edition.id, Round.silent.is_(False))
             .group_by(Round.id)
-            .having(func.count(distinct(Debate.id)) > 0)
-            .having(func.count(Speech.id) == 8 * func.count(distinct(Debate.id)))
+            .having(deb_cnt > 0)
+            .having(sp_scored == 8 * func.count(distinct(Debate.id)))
             .order_by(Round.number.asc())
         ).all()
 
@@ -986,53 +989,59 @@ def results_form():
         ).all()
         round_ids = [r_id for (r_id, _n, _nm) in rounds]
 
-        # conta speeches por debate para saber se está completo (>= 8 speeches)
+        # >>> CONTAR APENAS SPEECHES COM SCORE != NULL POR DEBATE
+        sp_scored = func.count(Speech.id).filter(Speech.score.is_not(None)).label("sp_scored")
         deb_speech_counts = sess.execute(
-            select(Debate.round_id, Debate.id, func.count(Speech.id))
+            select(Debate.round_id, Debate.id, sp_scored)
             .join(Speech, Speech.debate_id == Debate.id, isouter=True)
             .where(Debate.round_id.in_(round_ids))
-            .group_by(Debate.id)
+            .group_by(Debate.round_id, Debate.id)
         ).all()
 
         # round_id -> [True/False por debate]
         from collections import defaultdict
         round_done = defaultdict(list)
-        for r_id, d_id, cnt in deb_speech_counts:
-            round_done[r_id].append((cnt or 0) >= 8)
+        for r_id, d_id, scored in deb_speech_counts:
+            round_done[r_id].append(int(scored or 0) == 8)  # <<< exatamente 8 notas não nulas
 
         # rounds com flag "completed"
         rounds_with_status = []
         for (r_id, r_num, r_name) in rounds:
             flags = round_done.get(r_id, [])
+            # completed = existe pelo menos 1 debate E todos têm 8 notas não nulas
             completed = bool(flags) and all(flags)
             rounds_with_status.append((r_id, r_num, r_name, completed))
 
         # debates da 1ª rodada para popular inicial (completude também)
         first_round_id = rounds_with_status[0][0] if rounds_with_status else None
-        debates = []
+        debates = [] # TODO!
         if first_round_id:
             debates = sess.execute(
                 select(
                     Debate.id,
                     Debate.number_in_round,
-                    func.count(Speech.id).label("sp_count"),
+                    sp_scored,  # << mesmo critério
                 )
                 .join(Speech, Speech.debate_id == Debate.id, isouter=True)
                 .where(Debate.round_id == first_round_id)
                 .group_by(Debate.id)
                 .order_by(Debate.number_in_round.asc())
             ).all()
-            # vira lista de dicts: {id, number_in_round, completed}
             debates = [
-                {"id": d_id, "number_in_round": n, "completed": (spc or 0) >= 8}
-                for (d_id, n, spc) in debates
+                {
+                    "id": d_id,
+                    "number_in_round": n,
+                    "completed": int(scored or 0) == 8   # << exatamente 8 notas não nulas
+                }
+                for (d_id, n, scored) in debates
             ]
 
-        #return render_template("results.html", rounds=rounds_with_status, debates=debates)
+        # use 'debates' se quiser já preencher a lista inicial:
         return render_template("results.html", rounds=rounds_with_status, debates=[])
+        # se preferir vazio inicialmente, troque por: debates=[]
+
     finally:
         sess.close()
-
 # --- APIs auxiliares para o form ---
 
 @app.get("/api/round_debates")
@@ -1041,20 +1050,28 @@ def api_round_debates():
     round_id = int(request.args.get("round_id"))
     sess = SessionLocal()
     try:
+        sp_scored = func.count(Speech.id).filter(Speech.score.is_not(None)).label("sp_scored")
+
         rows = sess.execute(
             select(
                 Debate.id,
                 Debate.number_in_round,
-                func.count(Speech.id).label("sp_count"),
+                sp_scored,
             )
-            .join(Speech, Speech.debate_id == Debate.id, isouter=True)
+            .select_from(Debate)
+            .outerjoin(Speech, Speech.debate_id == Debate.id)
             .where(Debate.round_id == round_id)
             .group_by(Debate.id)
             .order_by(Debate.number_in_round.asc())
         ).all()
+
         data = [
-            {"id": d_id, "number_in_round": n, "completed": (spc or 0) >= 8}
-            for (d_id, n, spc) in rows
+            {
+                "id": d_id,
+                "number_in_round": n,
+                "completed": int(scored or 0) == 8,
+            }
+            for (d_id, n, scored) in rows
         ]
         return jsonify(data=data)
     finally:
