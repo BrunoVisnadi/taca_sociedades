@@ -15,6 +15,7 @@ from models import (
     EditionMember, Person, User, DebateJudge,
     SocietyAccount, MemberKindEnum, JudgeRoleEnum
 )
+from consts import MAX_DEBATES_PER_SPEAKER
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -161,14 +162,17 @@ def _debates_of_round_for_soc(sess, round_id: int, edition_society_id: int):
             "locked": bool(locked),
         })
     return out
-# lista de debatedores ELEGÍVEIS (< 4 usos em rodadas anteriores) para a próxima rodada
+# lista de debatedores ELEGÍVEIS (< MAX_DEBATES_PER_SPEAKER usos em rodadas anteriores) para a próxima rodada
 def _eligible_debaters_for_next_round(sess, edition_id: int, base_society_id: int, next_round_number: int):
     EM = aliased(EditionMember)
 
-    used_count = func.count(Speech.id).filter(
-        (Speech.score.is_not(None))
-        & (Round.edition_id == edition_id)
-        & (Round.number < next_round_number)
+    # conta debates distintos (onde houve pelo menos uma speech com score != NULL)
+    used_count = func.count(
+        distinct(Speech.debate_id)
+    ).filter(
+        (Speech.score.is_not(None)) &
+        (Round.edition_id == edition_id) &
+        (Round.number < next_round_number)
     ).label("used_count")
 
     rows = sess.execute(
@@ -179,20 +183,20 @@ def _eligible_debaters_for_next_round(sess, edition_id: int, base_society_id: in
         )
         .select_from(EM)
         .join(Person, Person.id == EM.person_id)
-        # JOINs para contar usos anteriores; LEFT para permitir 0
         .outerjoin(Speech, Speech.edition_member_id == EM.id)
         .outerjoin(Debate, Debate.id == Speech.debate_id)
         .outerjoin(Round, Round.id == Debate.round_id)
         .where(
             EM.edition_id == edition_id,
-            EM.kind == cast(literal("debater"), MemberKindEnum),   # enum OK
+            EM.kind == cast(literal("debater"), MemberKindEnum),  # enum OK
             Person.society_id == base_society_id,
         )
         .group_by(EM.id, Person.full_name)
         .order_by(Person.full_name.asc())
     ).all()
 
-    return [{"id": mid, "name": name} for (mid, name, used) in rows if int(used or 0) < 4]
+    return [{"id": mid, "name": name} for (mid, name, used) in rows if int(used or 0) < MAX_DEBATES_PER_SPEAKER]
+
 
 
 @app.get("/health-check")
@@ -249,7 +253,9 @@ def view_society_history(edsoc_id: int):
 
         # 1) Debatedores da sociedade na edição + contagem de usos (scores não-nulos)
         #    LEFT JOIN em Speech/Debate/Round permite "0" usos naturalmente
-        used_count = func.count(Speech.id).filter(Speech.score.is_not(None)).label("used_count")
+        used_count = func.count(distinct(Speech.debate_id)).filter(
+            Speech.score.is_not(None)
+        ).label("used_count")
 
         deb_rows = sess.execute(
             select(
@@ -265,7 +271,7 @@ def view_society_history(edsoc_id: int):
                 EM2.edition_id == edition_id,
                 EM2.kind == cast(literal("debater"), MemberKindEnum),
                 Person.society_id == society_id,
-                # conta apenas falas desta edição; permite None para quem não falou
+                # restringe à edição, mas preserva quem nunca falou (Round NULL)
                 (Round.edition_id == edition_id) | (Round.id.is_(None)),
             )
             .group_by(EM2.id, Person.full_name)
