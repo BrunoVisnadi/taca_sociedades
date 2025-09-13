@@ -5,7 +5,7 @@ from functools import wraps
 from flask import Flask, jsonify, render_template, request, redirect, url_for, flash, session, abort
 from flask_login import LoginManager, UserMixin
 from werkzeug.security import check_password_hash
-from sqlalchemy import cast, literal, distinct, desc, exists, select, func, case, and_
+from sqlalchemy import cast, literal, distinct, desc, exists, select, func, case, and_, or_
 from sqlalchemy.orm import aliased
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from db import SessionLocal
@@ -853,6 +853,7 @@ def view_results_list():
             })
 
         # ordenar debates dentro de cada round
+        is_staff = session.get('auth_kind') == 'staff'
         result_rounds = []
         for rid, rdata in sorted(by_round.items(), key=lambda kv: kv[1]["number"]):
             rdata["debates"].sort(key=lambda d: d["number"])
@@ -860,7 +861,7 @@ def view_results_list():
                 "id": rid,
                 "number": rdata["number"],
                 "date": rdata["date"],
-                "scores_published": rdata["scores_published"],
+                "scores_published": rdata["scores_published"] or is_staff,
                 "debates": rdata["debates"],
             })
 
@@ -1363,11 +1364,8 @@ def api_save_results():
 def api_standings(debug=False):
     sess = SessionLocal()
     try:
-        # --- edição alvo ---
-        if debug:
-            edition_param = 2025
-        else:
-            edition_param = request.args.get("edition", "current")
+        is_staff = session.get('auth_kind') == 'staff'
+        edition_param = request.args.get("edition", "current")
 
         if edition_param == "current":
             edition = get_current_edition(sess)
@@ -1459,7 +1457,13 @@ def api_standings(debug=False):
         firsts_expr = case((ranked_sq.c.rnk == 1, literal(1)), else_=literal(0))
         seconds_expr = case((ranked_sq.c.rnk == 2, literal(1)), else_=literal(0))
         sp_expr = case(
-            (ranked_sq.c.scores_published.is_(True), ranked_sq.c.team_total),
+            (
+                or_(
+                    ranked_sq.c.scores_published.is_(True),
+                    literal(is_staff)
+                ),
+                ranked_sq.c.team_total
+            ),
             else_=literal(0),
         )
 
