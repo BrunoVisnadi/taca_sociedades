@@ -231,6 +231,7 @@ def page_escalacao():
 
 @app.get("/sociedade/<int:edsoc_id>")
 def view_society_history(edsoc_id: int):
+    return ""
     sess = SessionLocal()
     EM2 = aliased(EditionMember)
     try:
@@ -1710,3 +1711,4 @@ def api_update_round_settings(round_id: int):
 
 if __name__ == "__main__":
     app.run(debug=True)
+
